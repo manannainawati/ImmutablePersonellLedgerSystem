@@ -1,0 +1,14 @@
+# Byte-compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary test data
+data/test_*
+
+# System & IDE artifacts
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log

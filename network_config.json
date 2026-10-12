@@ -1,0 +1,18 @@
+{
+  "personnel_registry": [
+    "EMP1001",
+    "EMP1002",
+    "EMP1003",
+    "EMP1004"
+  ],
+  "officials": {
+    "OFFICIAL_A": "MEMwBQYDK2VxAzoA3ybEHtlwhpWnud9zO18EbtgNDyLQU7Owm2ksplg8TK7qizb5qvdPFqLC6iXTn80bCs1UG80TdmKA",
+    "OFFICIAL_B": "MEMwBQYDK2VxAzoAuosD2ssqAc7U4KN5CfYaBu3Iqwh6Nbl4CU7SemXcOQS7PbgiBUPI1Y5mSOOwySr8SiuPJgVtGJuA"
+  },
+  "facility_key": "MRnQRbx4C8X6OzgTR8XyYfEX5_q4hlzFewZjDpm55dI=",
+  "peers": [
+    "http://localhost:5000",
+    "http://localhost:5001",
+    "http://localhost:5002"
+  ]
+}
