@@ -85,7 +85,9 @@ class TestChaincode(unittest.TestCase):
             )
 
         # 2-of-N co-signed override succeeds
-        co_bytes = b"CO_SIGN_OVERRIDE_EMP1001_" + str(t).encode()
+        co_bytes = ChaincodeEngine.compute_override_co_sign_bytes(
+            "EMP1001", "IN", "OFFICIAL_A", "OFFICIAL_B", t
+        )
         co_sig = cu.sign_bytes(self.priv_B, co_bytes)
 
         self.engine.execute_transaction(

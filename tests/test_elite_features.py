@@ -39,10 +39,11 @@ class TestEliteFeatures(unittest.TestCase):
         """Feature 1: Test that employee state tracks properly for digital badge generation."""
         # 1. Register employee
         t0 = time.time()
-        tx_b = Blockchain._tx_bytes("EMP9999", "REGISTER_EMPLOYEE", "OFFICIAL_A", t0)
+        extra_reg = {"department": "Quantum Security"}
+        tx_b = Blockchain._tx_bytes("EMP9999", "REGISTER_EMPLOYEE", "OFFICIAL_A", t0, extra_data=extra_reg)
         sig = cu.sign_bytes(self.priv_A, tx_b)
         block1 = self.chain.build_block_from_transaction(
-            "EMP9999", "REGISTER_EMPLOYEE", "OFFICIAL_A", t0, sig, extra_data={"department": "Quantum Security"}
+            "EMP9999", "REGISTER_EMPLOYEE", "OFFICIAL_A", t0, sig, extra_data=extra_reg
         )
         self.chain.append_block(block1)
 

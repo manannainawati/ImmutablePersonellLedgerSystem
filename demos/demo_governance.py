@@ -42,11 +42,12 @@ def main():
     t1 = time.time()
     assert not chain.world_state.is_employee_registered("EMP2001")
 
-    tx_b1 = Blockchain._tx_bytes("EMP2001", "REGISTER_EMPLOYEE", "OFFICIAL_A", t1)
+    extra1 = {"department": "Cybersecurity"}
+    tx_b1 = Blockchain._tx_bytes("EMP2001", "REGISTER_EMPLOYEE", "OFFICIAL_A", t1, extra_data=extra1)
     sig1 = cu.sign_bytes(priv_A, tx_b1)
     b1 = chain.build_block_from_transaction(
         "EMP2001", "REGISTER_EMPLOYEE", "OFFICIAL_A", t1, sig1,
-        extra_data={"department": "Cybersecurity"}
+        extra_data=extra1
     )
     chain.append_block(b1)
 
@@ -66,11 +67,12 @@ def main():
 
     print("\nStep 2: Testing On-Chain Key Revocation (REVOKE_OFFICIAL)...")
     t3 = t1 + 10
-    tx_b3 = Blockchain._tx_bytes("OFFICIAL_B", "REVOKE_OFFICIAL", "OFFICIAL_A", t3)
+    extra3 = {"target_official": "OFFICIAL_B"}
+    tx_b3 = Blockchain._tx_bytes("OFFICIAL_B", "REVOKE_OFFICIAL", "OFFICIAL_A", t3, extra_data=extra3)
     sig3 = cu.sign_bytes(priv_A, tx_b3)
     b3 = chain.build_block_from_transaction(
         "OFFICIAL_B", "REVOKE_OFFICIAL", "OFFICIAL_A", t3, sig3,
-        extra_data={"target_official": "OFFICIAL_B"}
+        extra_data=extra3
     )
     chain.append_block(b3)
     assert chain.world_state.is_official_revoked("OFFICIAL_B")
@@ -90,31 +92,37 @@ def main():
     # Re-enable OFFICIAL_B for override test in temporary state
     chain.world_state.register_official("OFFICIAL_B")
 
+    from contract import ChaincodeEngine
     t5 = t1 + 20
-    tx_b5 = Blockchain._tx_bytes("EMP1001", "ADMIN_OVERRIDE", "OFFICIAL_A", t5)
-    sig5 = cu.sign_bytes(priv_A, tx_b5)
-
-    co_bytes = b"CO_SIGN_OVERRIDE_EMP1001_" + str(t5).encode()
-    co_sig = cu.sign_bytes(priv_B, co_bytes)
 
     # 1-of-N fails
+    extra_1ofN = {"override_status": "OUT"}
+    tx_b_single = Blockchain._tx_bytes("EMP1001", "ADMIN_OVERRIDE", "OFFICIAL_A", t5, extra_data=extra_1ofN)
+    sig_single = cu.sign_bytes(priv_A, tx_b_single)
     try:
         chain.build_block_from_transaction(
-            "EMP1001", "ADMIN_OVERRIDE", "OFFICIAL_A", t5, sig5,
-            extra_data={"override_status": "OUT"}
+            "EMP1001", "ADMIN_OVERRIDE", "OFFICIAL_A", t5, sig_single,
+            extra_data=extra_1ofN
         )
         assert False, "Single signature override should have failed!"
     except ContractViolation as e:
         print(f"  [PASS] 1-of-N signature rejected: {e}")
 
     # 2-of-N succeeds
+    co_bytes = ChaincodeEngine.compute_override_co_sign_bytes("EMP1001", "OUT", "OFFICIAL_A", "OFFICIAL_B", t5)
+    co_sig = cu.sign_bytes(priv_B, co_bytes)
+
+    extra_2ofN = {
+        "override_status": "OUT",
+        "co_official_id": "OFFICIAL_B",
+        "co_signature": co_sig,
+    }
+    tx_b5 = Blockchain._tx_bytes("EMP1001", "ADMIN_OVERRIDE", "OFFICIAL_A", t5, extra_data=extra_2ofN)
+    sig5 = cu.sign_bytes(priv_A, tx_b5)
+
     b5 = chain.build_block_from_transaction(
         "EMP1001", "ADMIN_OVERRIDE", "OFFICIAL_A", t5, sig5,
-        extra_data={
-            "override_status": "OUT",
-            "co_official_id": "OFFICIAL_B",
-            "co_signature": co_sig,
-        }
+        extra_data=extra_2ofN
     )
     chain.append_block(b5)
     assert chain.world_state.get_employee("EMP1001")["status"] == "OUT"

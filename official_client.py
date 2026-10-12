@@ -21,7 +21,7 @@ import requests
 import crypto_utils as cu
 
 
-def submit(official_id, employee_id, action, node_url, keyfile=None):
+def submit(official_id, employee_id, action, node_url, keyfile=None, extra=None):
     """
     Sign an attendance transaction with the official's Ed448 private key
     and POST it to the specified node.
@@ -33,28 +33,35 @@ def submit(official_id, employee_id, action, node_url, keyfile=None):
         private_key = cu.private_key_from_str(f.read().strip())
 
     timestamp = time.time()
-    tx_bytes = json.dumps(
-        {
-            "employee_id": employee_id,
-            "action": action,
-            "official_id": official_id,
-            "timestamp": timestamp,
-        },
-        sort_keys=True,
-    ).encode()
+    payload = {
+        "action": action,
+        "employee_id": employee_id,
+        "official_id": official_id,
+        "timestamp": timestamp,
+    }
+    if extra:
+        clean_extra = {k: v for k, v in extra.items() if k != "co_signature"}
+        if clean_extra:
+            payload["extra"] = clean_extra
+
+    tx_bytes = json.dumps(payload, sort_keys=True).encode()
 
     # Ed448 sign — 114-byte deterministic signature (no RNG at signing time)
     signature = cu.sign_bytes(private_key, tx_bytes)
 
+    body = {
+        "employee_id": employee_id,
+        "action": action,
+        "official_id": official_id,
+        "timestamp": timestamp,
+        "signature": signature,
+    }
+    if extra:
+        body["extra"] = extra
+
     return requests.post(
         f"{node_url}/transactions/submit",
-        json={
-            "employee_id": employee_id,
-            "action": action,
-            "official_id": official_id,
-            "timestamp": timestamp,
-            "signature": signature,
-        },
+        json=body,
     )
 
 

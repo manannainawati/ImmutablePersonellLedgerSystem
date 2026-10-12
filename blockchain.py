@@ -34,6 +34,7 @@ class Blockchain:
         self.chaincode = ChaincodeEngine(
             config.get("personnel_registry", []),
             config.get("officials", {}).keys(),
+            official_public_keys=self.official_public_keys,
         )
         self.contract = self.chaincode  # backward compatibility alias
         self.world_state = self.chaincode.world_state
@@ -114,48 +115,61 @@ class Blockchain:
             raise ValueError("Corrupt genesis block in storage")
 
         # Replay transactions sequentially to restore World State
+        corrupted_index = None
         for i in range(1, len(blocks)):
             b = blocks[i]
             prev = blocks[i - 1]
             if b.previous_hash != prev.hash or b.hash != b.compute_hash():
-                raise ValueError(f"Corrupt chain linkage at block {b.index} in storage")
+                print(f"[blockchain] Corrupt chain linkage detected at block {b.index} in storage")
+                corrupted_index = i
+                break
 
-            if b.transactions:
-                for tx in b.transactions:
-                    tx_record = cu.decrypt_payload(self.facility_key, tx["encrypted_payload"])
+            try:
+                if b.transactions:
+                    for tx in b.transactions:
+                        tx_record = cu.decrypt_payload(self.facility_key, tx["encrypted_payload"])
+                        tx_data = {
+                            "employee_id": tx_record["employee_id"],
+                            "timestamp": tx_record.get("timestamp", tx["timestamp"]),
+                        }
+                        if "extra" in tx_record:
+                            tx_data.update(tx_record["extra"])
+                        self.chaincode.execute_transaction(self.world_state, tx_record["action"], tx_data, tx["official_id"])
+                else:
+                    record = self.decrypt_record(b)
                     tx_data = {
-                        "employee_id": tx_record["employee_id"],
-                        "timestamp": tx_record.get("timestamp", tx["timestamp"]),
+                        "employee_id": record["employee_id"],
+                        "timestamp": record.get("timestamp", b.timestamp),
                     }
-                    if "extra" in tx_record:
-                        tx_data.update(tx_record["extra"])
-                    self.chaincode.execute_transaction(self.world_state, tx_record["action"], tx_data, tx["official_id"])
-            else:
-                record = self.decrypt_record(b)
-                tx_data = {
-                    "employee_id": record["employee_id"],
-                    "timestamp": record.get("timestamp", b.timestamp),
-                }
-                if "extra" in record:
-                    tx_data.update(record["extra"])
-                self.chaincode.execute_transaction(self.world_state, record["action"], tx_data, b.official_id)
+                    if "extra" in record:
+                        tx_data.update(record["extra"])
+                    self.chaincode.execute_transaction(self.world_state, record["action"], tx_data, b.official_id)
+            except Exception as e:
+                print(f"[blockchain] State replay stopped at block {b.index}: {e}")
+                corrupted_index = i
+                break
 
         self.chain = blocks
-        print(f"[blockchain] Restored {len(self.chain)} blocks and World State from {self.storage_path}")
+        if corrupted_index is not None:
+            print(f"[blockchain] Storage contains corrupted block(s) from index {corrupted_index}; awaiting peer healing.")
+        else:
+            print(f"[blockchain] Restored {len(self.chain)} blocks and World State from {self.storage_path}")
 
     # ── Transaction bytes (canonical format) ─────────────────────────────────
 
     @staticmethod
-    def _tx_bytes(employee_id, action, official_id, timestamp):
-        return json.dumps(
-            {
-                "employee_id": employee_id,
-                "action": action,
-                "official_id": official_id,
-                "timestamp": timestamp,
-            },
-            sort_keys=True,
-        ).encode()
+    def _tx_bytes(employee_id, action, official_id, timestamp, extra_data=None):
+        payload = {
+            "action": action,
+            "employee_id": employee_id,
+            "official_id": official_id,
+            "timestamp": timestamp,
+        }
+        if extra_data:
+            clean_extra = {k: v for k, v in extra_data.items() if k != "co_signature"}
+            if clean_extra:
+                payload["extra"] = clean_extra
+        return json.dumps(payload, sort_keys=True).encode()
 
     def decrypt_record(self, block):
         if block.encrypted_payload == "GENESIS":
@@ -166,7 +180,7 @@ class Blockchain:
 
     def add_to_mempool(self, employee_id, action, official_id, timestamp, signature, extra_data=None):
         """
-        Validate transaction signature and contract rules, and place in mempool.
+        Validate transaction signature and contract rules sequentially, and place in mempool.
         """
         if official_id not in self.official_public_keys:
             raise ValueError(f"'{official_id}' is not a registered Higher Official")
@@ -174,7 +188,7 @@ class Blockchain:
         if not self.world_state.is_official_active(official_id):
             raise ContractViolation(f"Official '{official_id}' is REVOKED or inactive")
 
-        tx_bytes = self._tx_bytes(employee_id, action, official_id, timestamp)
+        tx_bytes = self._tx_bytes(employee_id, action, official_id, timestamp, extra_data=extra_data)
         if not cu.verify_signature(
             self.official_public_keys[official_id], tx_bytes, signature
         ):
@@ -187,9 +201,26 @@ class Blockchain:
         if extra_data:
             tx_data.update(extra_data)
 
-        # Dry-run execution
-        temp_state = self.world_state.clone()
-        self.chaincode.execute_transaction(temp_state, action, tx_data, official_id)
+        # Sequential dry-run execution against cumulative unconfirmed mempool state
+        simulated_state = self.world_state.clone()
+        sim_chaincode = ChaincodeEngine(
+            self.config.get("personnel_registry", []),
+            self.config.get("officials", {}).keys(),
+            official_public_keys=self.official_public_keys,
+        )
+        sim_chaincode.world_state = simulated_state
+
+        for pending in self.mempool:
+            p_data = {
+                "employee_id": pending["employee_id"],
+                "timestamp": pending["timestamp"],
+            }
+            if pending.get("extra"):
+                p_data.update(pending["extra"])
+            sim_chaincode.execute_transaction(simulated_state, pending["action"], p_data, pending["official_id"])
+
+        # Validate proposed transaction against state with preceding mempool transactions applied
+        sim_chaincode.execute_transaction(simulated_state, action, tx_data, official_id)
 
         payload = {
             "employee_id": employee_id,
@@ -209,6 +240,7 @@ class Blockchain:
             "timestamp": timestamp,
             "signature": signature,
             "encrypted_payload": encrypted,
+            "extra": extra_data,
         }
         self.mempool.append(tx_obj)
         return tx_obj
@@ -222,13 +254,21 @@ class Blockchain:
 
         batch = self.mempool[:max_txs]
         temp_state = self.world_state.clone()
+        batch_chaincode = ChaincodeEngine(
+            self.config.get("personnel_registry", []),
+            self.config.get("officials", {}).keys(),
+            official_public_keys=self.official_public_keys,
+        )
+        batch_chaincode.world_state = temp_state
 
         for tx in batch:
             tx_data = {
                 "employee_id": tx["employee_id"],
                 "timestamp": tx["timestamp"],
             }
-            temp_state.execute_transaction = self.chaincode.execute_transaction(
+            if tx.get("extra"):
+                tx_data.update(tx["extra"])
+            batch_chaincode.execute_transaction(
                 temp_state, tx["action"], tx_data, tx["official_id"]
             )
 
@@ -265,7 +305,7 @@ class Blockchain:
         if not self.world_state.is_official_active(official_id):
             raise ContractViolation(f"Official '{official_id}' is REVOKED or inactive")
 
-        tx_bytes = self._tx_bytes(employee_id, action, official_id, timestamp)
+        tx_bytes = self._tx_bytes(employee_id, action, official_id, timestamp, extra_data=extra_data)
         if not cu.verify_signature(
             self.official_public_keys[official_id], tx_bytes, signature
         ):
@@ -300,6 +340,7 @@ class Blockchain:
             "timestamp": timestamp,
             "signature": signature,
             "encrypted_payload": encrypted,
+            "extra": extra_data,
         }
 
         merkle_root = MerkleTree([tx_record]).root
@@ -320,8 +361,14 @@ class Blockchain:
         return block
 
     def append_block(self, block):
-        """Commit block to ledger, apply transactions to World State, and prune mempool."""
-        self.chain.append(block)
+        """Commit block to ledger, apply transactions to World State atomically, and prune mempool."""
+        staged_state = self.world_state.clone()
+        staged_chaincode = ChaincodeEngine(
+            self.config.get("personnel_registry", []),
+            self.config.get("officials", {}).keys(),
+            official_public_keys=self.official_public_keys,
+        )
+        staged_chaincode.world_state = staged_state
 
         if block.transactions:
             for tx in block.transactions:
@@ -332,10 +379,7 @@ class Blockchain:
                 }
                 if "extra" in tx_record:
                     tx_data.update(tx_record["extra"])
-                self.chaincode.execute_transaction(self.world_state, tx_record["action"], tx_data, tx["official_id"])
-
-                # Remove from mempool if present
-                self.mempool = [m for m in self.mempool if m.get("tx_id") != tx.get("tx_id")]
+                staged_chaincode.execute_transaction(staged_state, tx_record["action"], tx_data, tx["official_id"])
 
         elif block.encrypted_payload != "GENESIS":
             record = self.decrypt_record(block)
@@ -345,7 +389,19 @@ class Blockchain:
             }
             if "extra" in record:
                 tx_data.update(record["extra"])
-            self.chaincode.execute_transaction(self.world_state, record["action"], tx_data, block.official_id)
+            staged_chaincode.execute_transaction(staged_state, record["action"], tx_data, block.official_id)
+
+        # Atomic commit to active blockchain and world state
+        self.world_state = staged_state
+        self.chaincode.world_state = staged_state
+        self.chain.append(block)
+
+        # Prune mempool
+        if block.transactions:
+            committed_ids = {t.get("tx_id") for t in block.transactions}
+            self.mempool = [m for m in self.mempool if m.get("tx_id") not in committed_ids]
+        else:
+            self.mempool = [m for m in self.mempool if not (m["employee_id"] == block.official_id and m["timestamp"] == block.timestamp)]
 
         self._persist_block(block)
 
@@ -389,6 +445,7 @@ class Blockchain:
                 tx_bytes = self._tx_bytes(
                     record["employee_id"], record["action"],
                     tx["official_id"], record["timestamp"],
+                    extra_data=record.get("extra"),
                 )
                 official_key = self.official_public_keys.get(tx["official_id"])
                 if not official_key or not cu.verify_signature(
@@ -404,7 +461,7 @@ class Blockchain:
                     tx_data.update(record["extra"])
                 self.chaincode.execute_transaction(temp_state, record["action"], tx_data, tx["official_id"])
 
-            if block.state_root and block.state_root != temp_state.compute_state_root():
+            if not block.state_root or block.state_root != temp_state.compute_state_root():
                 raise ValueError("State root mismatch on multi-transaction block replay")
 
             return block.transactions[0]
@@ -419,6 +476,7 @@ class Blockchain:
             tx_bytes = self._tx_bytes(
                 record["employee_id"], record["action"],
                 block.official_id, record["timestamp"],
+                extra_data=record.get("extra"),
             )
             official_key = self.official_public_keys.get(block.official_id)
             if not official_key or not cu.verify_signature(
@@ -438,7 +496,7 @@ class Blockchain:
                 temp_state, record["action"], tx_data, block.official_id
             )
 
-            if block.state_root and block.state_root != expected_state_root:
+            if not block.state_root or block.state_root != expected_state_root:
                 raise ValueError("State root mismatch on block replay")
 
             return record
@@ -451,6 +509,7 @@ class Blockchain:
         replay_chaincode = ChaincodeEngine(
             self.config.get("personnel_registry", []),
             self.config.get("officials", {}).keys(),
+            official_public_keys=self.official_public_keys,
         )
         replay_state = replay_chaincode.world_state
 
@@ -492,6 +551,7 @@ class Blockchain:
                         tx_bytes = self._tx_bytes(
                             record["employee_id"], record["action"],
                             tx["official_id"], record["timestamp"],
+                            extra_data=record.get("extra"),
                         )
                         off_key = self.official_public_keys.get(tx["official_id"])
                         if not off_key or not cu.verify_signature(off_key, tx_bytes, tx["signature"]):
@@ -506,13 +566,14 @@ class Blockchain:
                     except Exception:
                         contract_ok = False
                         signature_ok = False
-                state_root_ok = (block.state_root is None or block.state_root == replay_state.compute_state_root())
+                state_root_ok = bool(block.state_root) and (block.state_root == replay_state.compute_state_root())
             else:
                 try:
                     record = self.decrypt_record(block)
                     tx_bytes = self._tx_bytes(
                         record["employee_id"], record["action"],
                         block.official_id, record["timestamp"],
+                        extra_data=record.get("extra"),
                     )
                     off_key = self.official_public_keys.get(block.official_id)
                     signature_ok = bool(off_key) and cu.verify_signature(off_key, tx_bytes, block.signature)
@@ -523,7 +584,7 @@ class Blockchain:
                     if "extra" in record:
                         tx_data.update(record["extra"])
                     new_root = replay_chaincode.execute_transaction(replay_state, record["action"], tx_data, block.official_id)
-                    state_root_ok = (block.state_root is None or block.state_root == new_root)
+                    state_root_ok = bool(block.state_root) and (block.state_root == new_root)
                 except Exception:
                     contract_ok = False
                     signature_ok = False
@@ -545,14 +606,28 @@ class Blockchain:
     # ── Longest-valid-chain adoption ──────────────────────────────────────────
 
     def replace_chain(self, new_chain_blocks):
-        """Adopt new_chain_blocks if longer and fully valid."""
+        """Adopt new_chain_blocks if longer (or healing invalid local) and fully valid."""
+        local_healthy = all(b["valid"] for b in self.is_chain_valid())
+        if local_healthy and len(new_chain_blocks) <= len(self.chain):
+            raise ValueError(f"rejected chain: candidate length ({len(new_chain_blocks)}) is not longer than current length ({len(self.chain)})")
+
+        if not new_chain_blocks:
+            raise ValueError("rejected chain: candidate chain is empty")
+
+        if new_chain_blocks[0].hash != self.chain[0].hash:
+            raise ValueError("rejected chain: genesis block does not match local genesis")
+
         replay_chaincode = ChaincodeEngine(
             self.config.get("personnel_registry", []),
             self.config.get("officials", {}).keys(),
+            official_public_keys=self.official_public_keys,
         )
         replay_state = replay_chaincode.world_state
 
         for i, block in enumerate(new_chain_blocks):
+            if block.index != i:
+                raise ValueError(f"non-consecutive block index {block.index} at position {i}")
+
             if i == 0:
                 if block.hash != block.compute_hash():
                     raise ValueError("invalid genesis block")
@@ -570,6 +645,7 @@ class Blockchain:
                     tx_bytes = self._tx_bytes(
                         record["employee_id"], record["action"],
                         tx["official_id"], record["timestamp"],
+                        extra_data=record.get("extra"),
                     )
                     off_key = self.official_public_keys.get(tx["official_id"])
                     if not off_key or not cu.verify_signature(off_key, tx_bytes, tx["signature"]):
@@ -581,13 +657,14 @@ class Blockchain:
                     if "extra" in record:
                         tx_data.update(record["extra"])
                     replay_chaincode.execute_transaction(replay_state, record["action"], tx_data, tx["official_id"])
-                if block.state_root and block.state_root != replay_state.compute_state_root():
+                if not block.state_root or block.state_root != replay_state.compute_state_root():
                     raise ValueError(f"state root mismatch at block {block.index}")
             else:
                 record = self.decrypt_record(block)
                 tx_bytes = self._tx_bytes(
                     record["employee_id"], record["action"],
                     block.official_id, record["timestamp"],
+                    extra_data=record.get("extra"),
                 )
                 off_key = self.official_public_keys.get(block.official_id)
                 if not off_key or not cu.verify_signature(off_key, tx_bytes, block.signature):
@@ -599,7 +676,7 @@ class Blockchain:
                 if "extra" in record:
                     tx_data.update(record["extra"])
                 new_root = replay_chaincode.execute_transaction(replay_state, record["action"], tx_data, block.official_id)
-                if block.state_root and block.state_root != new_root:
+                if not block.state_root or block.state_root != new_root:
                     raise ValueError(f"state root mismatch at block {block.index}")
 
         self.chain = new_chain_blocks

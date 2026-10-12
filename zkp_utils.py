@@ -67,17 +67,18 @@ def verify_commitment(C: int, v: int, r: int) -> bool:
 # ── Fiat-Shamir Hash Helper ──────────────────────────────────────────────────
 
 def _hash_to_scalar(*args) -> int:
-    """Computes challenge scalar e in Z_q from arbitrary serializable arguments."""
-    hasher = blake3.blake3(b"IPLS-ZKP-FIAT-SHAMIR-CHALLENGE-v1")
+    """Computes challenge scalar e in Z_q with unambiguous length-prefixed domain framing."""
+    hasher = blake3.blake3(b"IPLS-ZKP-FIAT-SHAMIR-CHALLENGE-v2")
     for a in args:
         if isinstance(a, int):
-            hasher.update(str(a).encode())
+            raw = str(a).encode()
         elif isinstance(a, str):
-            hasher.update(a.encode())
+            raw = a.encode()
         elif isinstance(a, bytes):
-            hasher.update(a)
+            raw = a
         else:
-            hasher.update(json.dumps(a, sort_keys=True).encode())
+            raw = json.dumps(a, sort_keys=True).encode()
+        hasher.update(len(raw).to_bytes(4, "big") + raw)
     digest = hasher.digest()
     return int.from_bytes(digest, "big") % Q
 
@@ -303,9 +304,16 @@ def verify_compliance_proof(proof: dict) -> tuple[bool, str]:
 
         threshold = proof["threshold"]
         C_value = int(proof["commitment_C"], 16)
+        opening_C = int(proof["opening_proof"]["C"], 16)
+        if C_value != opening_C:
+            return False, "Failed verification: opening_proof commitment does not match package commitment_C"
+
+        range_bits = proof.get("range_bits", RANGE_BITS)
+        if range_bits <= 0 or range_bits > 32:
+            return False, f"Invalid range_bits {range_bits}. Must be between 1 and 32."
+
         bit_commitments = [int(c, 16) for c in proof["bit_commitments"]]
         bit_proofs = proof["bit_proofs"]
-        range_bits = proof.get("range_bits", RANGE_BITS)
         context = f"{proof['employee_id']}:{proof['claim_type']}:{threshold}"
 
         if len(bit_commitments) != range_bits or len(bit_proofs) != range_bits:

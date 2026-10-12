@@ -60,6 +60,9 @@ def verify_certificate_dict(cert: dict, config: dict = None) -> bool:
     events = cert.get("audit_events", [])
     print(f"\nVerifying {len(events)} On-Chain Historical Events:")
 
+    from merkle_tree import MerkleTree
+    from blockchain import Blockchain
+
     for i, ev in enumerate(events):
         idx = ev.get("block_index")
         action = ev.get("action")
@@ -71,27 +74,30 @@ def verify_certificate_dict(cert: dict, config: dict = None) -> bool:
 
         print(f"\n  Event #{i+1} — Block #{idx}: {action} at {ts} (Official: {off_id})")
 
-        # Verify Ed448 signature
-        tx_bytes = json.dumps({
-            "action": action,
-            "employee_id": cert.get("employee_id"),
-            "official_id": off_id,
-            "timestamp": ev.get("timestamp"),
-        }, sort_keys=True).encode()
+        # Verify Ed448 signature using canonical transaction bytes
+        tx_bytes = Blockchain._tx_bytes(
+            cert.get("employee_id"), action, off_id, ev.get("timestamp"), extra_data=ev.get("extra")
+        )
 
         pub_key = official_keys.get(off_id)
-        if pub_key and cu.verify_signature(pub_key, tx_bytes, sig):
-            print(f"    [PASS] Ed448 Digital Signature verified with official public key")
-        else:
-            print(f"    [WARN/PASS] Signature authenticated under block consensus authority")
+        if not pub_key or not cu.verify_signature(pub_key, tx_bytes, sig):
+            print(f"    [FAIL] Ed448 Digital Signature verification FAILED for official {off_id}")
+            return False
+        print(f"    [PASS] Ed448 Digital Signature verified with official public key")
 
         # Verify SPV Merkle inclusion proof
         if spv_proof and merkle_root:
-            tx_item = {"employee_id": cert.get("employee_id"), "action": action, "timestamp": ev.get("timestamp")}
-            # If standard leaf format matches
-            print(f"    [PASS] SPV Merkle Proof path verified with {len(spv_proof)} sibling nodes")
-        else:
-            print(f"    [PASS] Root commitment verified: Merkle Root = {merkle_root[:16] if merkle_root else 'None'}...")
+            tx_leaf = ev.get("tx_leaf") or {
+                "employee_id": cert.get("employee_id"),
+                "action": action,
+                "timestamp": ev.get("timestamp"),
+            }
+            if not MerkleTree.verify_proof(tx_leaf, spv_proof, merkle_root):
+                print(f"    [FAIL] SPV Merkle inclusion proof verification FAILED against root {merkle_root}")
+                return False
+            print(f"    [PASS] SPV Merkle Proof path mathematically verified with {len(spv_proof)} sibling nodes")
+        elif merkle_root:
+            print(f"    [PASS] Root commitment verified: Merkle Root = {merkle_root[:16]}...")
 
     print(f"\n=======================================================")
     print(f"  [RESULT] 100% AUDIT INTEGRITY CONFIRMED")

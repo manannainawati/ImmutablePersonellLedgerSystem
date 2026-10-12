@@ -22,6 +22,7 @@ import os
 import shutil
 import sys
 import time
+import threading
 
 import requests
 from flask import Flask, request, jsonify, render_template
@@ -40,6 +41,7 @@ chain = None
 SELF_URL = None
 PEERS = CONFIG["peers"]
 PORT = 5000
+CHAIN_LOCK = threading.RLock()
 
 
 @app.after_request
@@ -81,9 +83,10 @@ def _auto_sync(force=False):
                 blocks_data = resp.json()
                 blocks = [Block.from_dict(b) for b in blocks_data]
                 peer_valid = all(b.get("valid", True) for b in blocks_data)
-                if peer_valid and ((len(blocks) > len(chain.chain)) or (not local_valid and len(blocks) >= len(chain.chain)) or force):
-                    if best is None or len(blocks) > len(best):
-                        best = blocks
+                if peer_valid:
+                    if len(blocks) > len(chain.chain) or (not local_valid and len(blocks) >= len(chain.chain)):
+                        if best is None or len(blocks) > len(best):
+                            best = blocks
         except Exception:
             continue
 
@@ -110,19 +113,20 @@ def submit_transaction():
     Ed448 signature the official produced on their own device.
     """
     data = request.get_json()
-    try:
-        block = chain.build_block_from_transaction(
-            data["employee_id"],
-            data["action"],
-            data["official_id"],
-            data["timestamp"],
-            data["signature"],
-            extra_data=data.get("extra"),
-        )
-    except (ValueError, ContractViolation) as e:
-        return jsonify({"accepted": False, "error": str(e)}), 400
+    with CHAIN_LOCK:
+        try:
+            block = chain.build_block_from_transaction(
+                data["employee_id"],
+                data["action"],
+                data["official_id"],
+                data["timestamp"],
+                data["signature"],
+                extra_data=data.get("extra"),
+            )
+        except (ValueError, ContractViolation) as e:
+            return jsonify({"accepted": False, "error": str(e)}), 400
 
-    chain.append_block(block)
+        chain.append_block(block)
     _broadcast(block)
     return jsonify({"accepted": True, "block": block.to_dict()}), 201
 
@@ -152,13 +156,14 @@ def receive_block():
     using our own local state.
     """
     block = Block.from_dict(request.get_json())
-    try:
-        chain.validate_incoming_block(block)
-    except (ValueError, ContractViolation) as e:
-        print(f"[reject] block {block.index}: {e}")
-        return jsonify({"accepted": False, "reason": str(e)}), 409
+    with CHAIN_LOCK:
+        try:
+            chain.validate_incoming_block(block)
+        except (ValueError, ContractViolation) as e:
+            print(f"[reject] block {block.index}: {e}")
+            return jsonify({"accepted": False, "reason": str(e)}), 409
 
-    chain.append_block(block)
+        chain.append_block(block)
     return jsonify({"accepted": True}), 200
 
 
@@ -209,11 +214,12 @@ def mine_block():
     data = request.get_json() or {}
     proposer = data.get("proposer_id", "OFFICIAL_A")
     max_txs = int(data.get("max_txs", 10))
-    block = chain.build_block_from_mempool(max_txs=max_txs, proposer_id=proposer)
-    if not block:
-        return jsonify({"mined": False, "reason": "mempool is empty"}), 400
+    with CHAIN_LOCK:
+        block = chain.build_block_from_mempool(max_txs=max_txs, proposer_id=proposer)
+        if not block:
+            return jsonify({"mined": False, "reason": "mempool is empty"}), 400
 
-    chain.append_block(block)
+        chain.append_block(block)
     _broadcast(block)
     return jsonify({"mined": True, "block": block.to_dict()}), 201
 
@@ -270,16 +276,19 @@ def resolve_and_sync():
     Ask every peer for their chain; if any peer has a longer or valid chain,
     adopt it, heal corrupted local blocks, and update on-disk WAL.
     """
-    healed = _auto_sync(force=True)
-    valid_summary = chain.is_chain_valid()
-    is_now_valid = all(b["valid"] for b in valid_summary)
-    return jsonify({
-        "synchronized": True,
-        "healed": healed,
-        "valid": is_now_valid,
-        "length": len(chain.chain),
-        "state_root": chain.world_state.compute_state_root(),
-    })
+    with CHAIN_LOCK:
+        healed = _auto_sync(force=True)
+        valid_summary = chain.is_chain_valid()
+        is_now_valid = all(b["valid"] for b in valid_summary)
+        return jsonify({
+            "synchronized": True,
+            "healed": healed,
+            "replaced": healed,
+            "message": "Chain synchronized and healed from peer consensus" if healed else "Local chain is already valid and up-to-date",
+            "valid": is_now_valid,
+            "length": len(chain.chain),
+            "state_root": chain.world_state.compute_state_root(),
+        })
 
 
 @app.route("/nodes/peers_status")
@@ -332,12 +341,13 @@ def tamper_local_block():
     """
     data = request.get_json() or {}
     idx = int(data.get("block_index", 1))
-    if idx <= 0 or idx >= len(chain.chain):
-        return jsonify({"success": False, "error": f"Invalid block index {idx}. Genesis block cannot be tampered."}), 400
+    with CHAIN_LOCK:
+        if idx <= 0 or idx >= len(chain.chain):
+            return jsonify({"success": False, "error": f"Invalid block index {idx}. Genesis block cannot be tampered."}), 400
 
-    target = chain.chain[idx]
-    target.encrypted_payload = "CORRUPTED_CIPHERTEXT_" + os.urandom(8).hex()
-    chain._rewrite_storage()
+        target = chain.chain[idx]
+        target.encrypted_payload = "CORRUPTED_CIPHERTEXT_" + os.urandom(8).hex()
+        chain._rewrite_storage()
     print(f"[tamper] Corrupted block #{idx} on Node {PORT} for attack demonstration.")
     return jsonify({
         "success": True,
@@ -424,32 +434,38 @@ def portal_sign_and_submit():
         priv_key = cu.private_key_from_str(f.read().strip())
 
     timestamp = time.time()
-    tx_bytes = Blockchain._tx_bytes(employee_id, action, official_id, timestamp)
-    signature = cu.sign_bytes(priv_key, tx_bytes)
 
     # Auto co-sign for 2-of-N Multi-Sig emergency override if co-signer key exists locally
     if action == "ADMIN_OVERRIDE" and isinstance(extra, dict) and extra.get("co_official_id") and not extra.get("co_signature"):
         co_id = extra["co_official_id"]
         co_keyfile = f"keys/{co_id}.key"
         if os.path.exists(co_keyfile):
+            from contract import ChaincodeEngine
             with open(co_keyfile, "r") as f:
                 co_priv = cu.private_key_from_str(f.read().strip())
-            co_bytes = b"CO_SIGN_OVERRIDE_" + employee_id.encode() + b"_" + str(timestamp).encode()
+            target_status = extra.get("override_status", "OUT")
+            co_bytes = ChaincodeEngine.compute_override_co_sign_bytes(
+                employee_id, target_status, official_id, co_id, timestamp
+            )
             extra["co_signature"] = cu.sign_bytes(co_priv, co_bytes)
 
-    try:
-        block = chain.build_block_from_transaction(
-            employee_id=employee_id,
-            action=action,
-            official_id=official_id,
-            timestamp=timestamp,
-            signature=signature,
-            extra_data=extra,
-        )
-    except (ValueError, ContractViolation) as e:
-        return jsonify({"accepted": False, "error": str(e)}), 400
+    tx_bytes = Blockchain._tx_bytes(employee_id, action, official_id, timestamp, extra_data=extra)
+    signature = cu.sign_bytes(priv_key, tx_bytes)
 
-    chain.append_block(block)
+    with CHAIN_LOCK:
+        try:
+            block = chain.build_block_from_transaction(
+                employee_id=employee_id,
+                action=action,
+                official_id=official_id,
+                timestamp=timestamp,
+                signature=signature,
+                extra_data=extra,
+            )
+        except (ValueError, ContractViolation) as e:
+            return jsonify({"accepted": False, "error": str(e)}), 400
+
+        chain.append_block(block)
     _broadcast(block)
     return jsonify({
         "accepted": True,
@@ -642,13 +658,16 @@ def zkp_generate_proof():
 
     # Convert to minutes for compact, fast bit decomposition proof
     actual_seconds = emp.get("total_seconds_worked", 0)
-    actual_minutes = int(actual_seconds / 60.0)
     threshold_minutes = int(threshold_hours * 60)
 
     # Allow testing with simulated hours if employee has not completed a full shift yet
     simulated_hours = data.get("simulated_hours")
+    is_simulated = False
     if simulated_hours is not None:
+        is_simulated = True
         actual_minutes = int(float(simulated_hours) * 60)
+    else:
+        actual_minutes = int(actual_seconds / 60.0)
 
     if actual_minutes < threshold_minutes:
         return jsonify({
@@ -662,10 +681,13 @@ def zkp_generate_proof():
             employee_id=employee_id,
             claim_type="MIN_SHIFT_HOURS",
         )
+        claim_mode = "SIMULATED_DEMO" if is_simulated else "ON_CHAIN_WORLD_STATE"
+
         return jsonify({
             "success": True,
             "claim": f"Total shift duration is strictly >= {threshold_hours} hours",
             "threshold_hours": threshold_hours,
+            "data_source": claim_mode,
             "proof": proof,
             "privacy_guarantee": "ZERO timestamps or exact durations leaked to verifier.",
         })
@@ -714,4 +736,7 @@ if __name__ == "__main__":
     print(f"[node] Starting IPLS node on {SELF_URL}")
     app.run(port=args.port)
 else:
-    init_node(5000)
+    try:
+        init_node(5000)
+    except Exception as e:
+        print(f"[node] Warning: init_node(5000) non-fatal fallback on import: {e}")

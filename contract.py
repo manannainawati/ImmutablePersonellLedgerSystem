@@ -13,6 +13,7 @@ This module implements the deterministic Smart Contract / Chaincode layer:
   4. ADMIN_OVERRIDE (Multi-Signature 2-of-N Governance)
      - Retroactive status corrections require co-signatures from TWO distinct active officials
 """
+import json
 from world_state import WorldState
 
 
@@ -27,8 +28,32 @@ class ChaincodeEngine:
     transitions the World State.
     """
 
-    def __init__(self, initial_personnel=None, initial_officials=None):
+    def __init__(self, initial_personnel=None, initial_officials=None, official_public_keys=None):
         self.world_state = WorldState(initial_personnel, initial_officials)
+        self.official_public_keys = dict(official_public_keys) if official_public_keys else {}
+        if not self.official_public_keys:
+            try:
+                import crypto_utils as cu
+                with open("network_config.json") as f:
+                    cfg = json.load(f)
+                self.official_public_keys = {
+                    k: cu.public_key_from_str(v if isinstance(v, str) else v.get("public_key"))
+                    for k, v in cfg.get("officials", {}).items()
+                }
+            except Exception:
+                pass
+
+    @staticmethod
+    def compute_override_co_sign_bytes(emp_id: str, override_status: str, primary_official: str, co_official: str, ts: float) -> bytes:
+        """Canonical message that a co-signing official must sign with Ed448 for 2-of-N overrides."""
+        return json.dumps({
+            "action": "ADMIN_OVERRIDE_CO_SIGN",
+            "co_official": co_official,
+            "employee_id": emp_id,
+            "override_status": override_status,
+            "primary_official": primary_official,
+            "timestamp": ts,
+        }, sort_keys=True).encode()
 
     # ── High-Level Chaincode Dispatcher ──────────────────────────────────────
 
@@ -45,6 +70,10 @@ class ChaincodeEngine:
         action = action.upper()
         emp_id = data.get("employee_id")
         ts = data.get("timestamp", 0)
+
+        # Invariant: Timestamp must be a valid positive number
+        if not isinstance(ts, (int, float)) or ts <= 0:
+            raise ContractViolation(f"Invalid transaction timestamp '{ts}'. Must be positive number.")
 
         if action in ("CHECK_IN", "CHECK_OUT"):
             self._handle_attendance(state, emp_id, action, ts, official_id)
@@ -86,8 +115,13 @@ class ChaincodeEngine:
             if current_status == "OUT":
                 raise ContractViolation(f"'{emp_id}' is not checked in")
             
-            # Check shift duration warning (>16 hours = 57,600s)
             last_in = emp.get("last_check_in")
+            if last_in is not None and ts < last_in:
+                raise ContractViolation(
+                    f"Negative shift duration: Check-out timestamp ({ts}) cannot be earlier than check-in ({last_in})"
+                )
+
+            # Check shift duration warning (>16 hours = 57,600s)
             if last_in and (ts - last_in) > 57600:
                 emp["shift_warning"] = "EXCESSIVE_SHIFT_DURATION_EXCEEDS_16H"
 
@@ -112,9 +146,12 @@ class ChaincodeEngine:
     def _handle_override(self, state: WorldState, emp_id: str, ts: float, official_id: str, data: dict):
         """
         Multi-Signature (2-of-N) emergency override governance.
-        Requires co-signature from a second distinct active official.
+        Requires cryptographic co-signature from a second distinct active official.
         """
         target_status = data.get("override_status", "OUT")
+        if target_status not in ("IN", "OUT"):
+            raise ContractViolation(f"Invalid override_status '{target_status}'. Must be strictly 'IN' or 'OUT'")
+
         co_official = data.get("co_official_id")
         co_signature = data.get("co_signature")
 
@@ -127,10 +164,29 @@ class ChaincodeEngine:
         if not state.is_official_active(co_official):
             raise ContractViolation(f"Co-signing official '{co_official}' is not active or authorized")
 
+        # Cryptographically verify the co-signature over the canonical override payload
+        co_pubkey = self.official_public_keys.get(co_official)
+        if co_pubkey:
+            import crypto_utils as cu
+            co_bytes = self.compute_override_co_sign_bytes(emp_id, target_status, official_id, co_official, ts)
+            if not cu.verify_signature(co_pubkey, co_bytes, co_signature):
+                raise ContractViolation(
+                    f"Cryptographic verification failed: Ed448 co-signature from '{co_official}' is invalid"
+                )
+        else:
+            raise ContractViolation(f"Public key for co-signing official '{co_official}' is not loaded")
+
         if not state.is_employee_registered(emp_id):
             raise ContractViolation(f"'{emp_id}' is not in the personnel registry")
 
         emp = state.get_employee(emp_id)
+
+        # Shift accounting reconciliation
+        if target_status == "OUT" and emp.get("status") == "IN" and emp.get("last_check_in"):
+            if ts >= emp["last_check_in"]:
+                worked = ts - emp["last_check_in"]
+                emp["total_seconds_worked"] = emp.get("total_seconds_worked", 0.0) + worked
+
         emp["status"] = target_status
         emp["last_override"] = {
             "authorized_by": [official_id, co_official],

@@ -140,7 +140,9 @@ class MerkleTree:
 
             if pos == "left":
                 current_hash = hash_internal(sibling_hash, current_hash)
-            else:
+            elif pos == "right":
                 current_hash = hash_internal(current_hash, sibling_hash)
+            else:
+                return False  # Strictly reject malformed proof steps
 
         return current_hash.lower() == expected_root.lower()
