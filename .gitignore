@@ -3,9 +3,20 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Cryptographic Private Keys & Shared Secrets (DO NOT PUBLISH OR COMMIT)
+keys/*.key
+keys/*.pem
+*.key
+*.pem
+.env
+facility.key
+secrets/
+
+# Generated Compliance Certificates
+certificate_*.json
+
 # Temporary test & node persistence data
-data/test_*
-data/node_*
+data/
 *.tmp
 
 # System & IDE artifacts

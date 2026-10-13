@@ -337,14 +337,26 @@ def peers_status():
     return jsonify(statuses)
 
 
+def _is_debug_authorized() -> bool:
+    """Enforce token-based authorization check for sensitive debug endpoints."""
+    if os.environ.get("ENABLE_DEBUG_ENDPOINTS", "true").lower() in ("false", "0", "no"):
+        return False
+    auth_token = request.headers.get("X-Debug-Auth") or request.args.get("debug_token")
+    expected_token = os.environ.get("IPLS_DEBUG_TOKEN", "IPLS-INTERNAL-SECURITY-TEST-TOKEN")
+    return auth_token == expected_token
+
+
 @app.route("/debug/tamper_local_block", methods=["POST"])
 def tamper_local_block():
     """
-    FOR DEMONSTRATION / REVIEW ONLY.
+    FOR SECURITY AUDIT & CONTROLLED TESTING ONLY.
     Corrupts an in-memory & on-disk block on this node to simulate disk bit-rot
     or unauthorized local manipulation. This demonstrates that any single-byte
     alteration immediately breaks cryptographic chain validity and State Root.
     """
+    if not _is_debug_authorized():
+        return jsonify({"success": False, "error": "Unauthorized: debug endpoints require authentication"}), 403
+
     data = request.get_json() or {}
     idx = int(data.get("block_index", 1))
     with CHAIN_LOCK:
@@ -368,10 +380,13 @@ def tamper_local_block():
 @app.route("/debug/forge_and_broadcast", methods=["POST"])
 def forge_and_broadcast():
     """
-    FOR DEMONSTRATION / REVIEW ONLY.
+    FOR SECURITY AUDIT & CONTROLLED TESTING ONLY.
     Builds a block with a valid BLAKE3 hash chain but a FAKE Ed448 signature,
     proving peers independently reject it on signature check.
     """
+    if not _is_debug_authorized():
+        return jsonify({"success": False, "error": "Unauthorized: debug endpoints require authentication"}), 403
+
     data = request.get_json() or {}
     payload = {
         "employee_id": data.get("employee_id", "EMP1003"),
@@ -558,33 +573,54 @@ def audit_certificate(employee_id):
         if matched:
             audit_records.append({
                 "block_index": b.index,
-                "timestamp": b.timestamp,
+                "timestamp": tx_details.get("timestamp", b.timestamp),
                 "action": tx_details.get("action"),
                 "official_id": official_id,
                 "ed448_signature": sig,
+                "extra": tx_details.get("extra"),
+                # Block header anchoring & PoA consensus verification
                 "block_hash": b.hash,
+                "previous_hash": b.previous_hash,
+                "block_proposer_id": b.official_id,
+                "block_signature": b.signature,
+                "block_timestamp": b.timestamp,
                 "state_root": b.state_root,
                 "merkle_root": b.merkle_root,
+                "encrypted_payload": b.encrypted_payload,
                 "spv_merkle_proof": merkle_proof,
                 "tx_leaf": tx_leaf,
             })
+
+    issuer_id = os.environ.get("CERT_ISSUER_ID", "OFFICIAL_A")
+    last_block = chain.chain[-1]
 
     cert_data = {
         "certificate_id": f"CERT-IPLS-{employee_id}-{int(time.time())}",
         "standard": "ISO-27001 / SOC-2 Type II Digital Custody Audit",
         "issued_at": time.time(),
+        "issuer_id": issuer_id,
         "employee_id": employee_id,
         "department": emp.get("department", "General"),
         "current_status": emp.get("status"),
         "total_seconds_worked": emp.get("total_seconds_worked", 0),
         "total_hours_worked": round(emp.get("total_seconds_worked", 0) / 3600.0, 2),
         "state_root_at_issuance": chain.world_state.compute_state_root(),
+        "checkpoint_block_index": last_block.index,
+        "checkpoint_block_hash": last_block.hash,
         "on_chain_events_count": len(audit_records),
         "audit_events": audit_records,
     }
 
     cert_canonical_bytes = json.dumps(cert_data, sort_keys=True).encode()
-    cert_data["cryptographic_seal"] = hash_utils.compute_block_hash(cert_canonical_bytes)
+    seal = hash_utils.compute_block_hash(cert_canonical_bytes)
+    cert_data["cryptographic_seal"] = seal
+
+    # Sign the cryptographic seal using the issuer official's private key
+    issuer_keyfile = os.environ.get("CERT_ISSUER_KEY", f"keys/{issuer_id}.key")
+    if os.path.exists(issuer_keyfile):
+        with open(issuer_keyfile, "r", encoding="utf-8") as f:
+            issuer_priv = cu.private_key_from_str(f.read().strip())
+        cert_data["issuer_signature"] = cu.sign_bytes(issuer_priv, seal.encode())
 
     return jsonify(cert_data)
 

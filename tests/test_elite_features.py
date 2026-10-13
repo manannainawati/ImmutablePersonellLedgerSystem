@@ -13,6 +13,7 @@ import time
 
 import crypto_utils as cu
 from blockchain import Blockchain
+from merkle_tree import MerkleTree
 from verify_certificate import verify_certificate_dict
 import hash_utils
 
@@ -80,35 +81,48 @@ class TestEliteFeatures(unittest.TestCase):
         self.chain.append_block(block)
 
         # Simulate /audit/certificate/EMP1001 payload construction
+        tx_leaf = block.transactions[0]
+        tree = MerkleTree(block.transactions)
         audit_records = [{
             "block_index": block.index,
             "timestamp": block.timestamp,
             "action": "CHECK_IN",
-            "official_id": block.official_id,
-            "ed448_signature": block.signature,
+            "official_id": tx_leaf["official_id"],
+            "ed448_signature": tx_leaf["signature"],
             "block_hash": block.hash,
+            "previous_hash": block.previous_hash,
+            "block_proposer_id": block.official_id,
+            "block_signature": block.signature,
+            "block_timestamp": block.timestamp,
             "state_root": block.state_root,
             "merkle_root": block.merkle_root,
-            "spv_merkle_proof": [],
+            "encrypted_payload": block.encrypted_payload,
+            "spv_merkle_proof": tree.get_proof(0),
+            "tx_leaf": tx_leaf,
         }]
 
         cert_data = {
             "certificate_id": f"CERT-IPLS-EMP1001-{int(t0)}",
             "standard": "ISO-27001 / SOC-2 Type II Digital Custody Audit",
             "issued_at": t0,
+            "issuer_id": "OFFICIAL_A",
             "employee_id": "EMP1001",
             "department": "Engineering",
             "current_status": "IN",
             "total_seconds_worked": 0,
             "total_hours_worked": 0.0,
             "state_root_at_issuance": self.chain.world_state.compute_state_root(),
+            "checkpoint_block_index": block.index,
+            "checkpoint_block_hash": block.hash,
             "on_chain_events_count": len(audit_records),
             "audit_events": audit_records,
         }
 
-        # Domain-keyed BLAKE3 seal
+        # Domain-keyed BLAKE3 seal & Issuer Ed448 signature
         cert_canonical_bytes = json.dumps(cert_data, sort_keys=True).encode()
-        cert_data["cryptographic_seal"] = hash_utils.compute_block_hash(cert_canonical_bytes)
+        seal = hash_utils.compute_block_hash(cert_canonical_bytes)
+        cert_data["cryptographic_seal"] = seal
+        cert_data["issuer_signature"] = cu.sign_bytes(self.priv_A, seal.encode())
 
         # Run offline verification with standalone tool
         verified = verify_certificate_dict(cert_data, config=self.config)

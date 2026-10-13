@@ -52,7 +52,7 @@ def build_sample_chain():
         ts = time.time()
         tx_bytes = Blockchain._tx_bytes(emp, action, off_id, ts)
         sig = cu.sign_bytes(priv_key, tx_bytes)
-        blk = chain.build_block_from_transaction(emp, action, off_id, ts, sig)
+        blk = chain.build_block_from_transaction(emp, action, off_id, ts, sig, proposer_key=priv_key)
         chain.append_block(blk)
 
     add("EMP1001", "CHECK_IN", "OFFICIAL_A", priv_A)

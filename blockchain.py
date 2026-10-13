@@ -26,7 +26,16 @@ import hash_utils
 class Blockchain:
     def __init__(self, config, storage_path=None):
         self.config = config
-        self.facility_key = config["facility_key"].encode()
+        fac_key_str = os.environ.get("FACILITY_KEY") or config.get("facility_key")
+        if not fac_key_str and os.path.exists("facility.key"):
+            try:
+                with open("facility.key", "r", encoding="utf-8") as f:
+                    fac_key_str = f.read().strip()
+            except Exception:
+                pass
+        if not fac_key_str:
+            raise ValueError("Facility key not found: set FACILITY_KEY env var, facility.key file, or config")
+        self.facility_key = fac_key_str.encode() if isinstance(fac_key_str, str) else fac_key_str
         self.official_public_keys = {
             oid: cu.public_key_from_str(pk)
             for oid, pk in config["officials"].items()
@@ -226,8 +235,8 @@ class Blockchain:
     def _verify_block_proposer_and_signature(self, block, current_state) -> bool:
         """
         Verify that block.official_id is an authorized active official and
-        block.signature cryptographically verifies against their public key.
-        (Fixes Finding B)
+        block.signature cryptographically verifies against their public key
+        over the canonical block header bytes.
         """
         if block.index == 0:
             return block.official_id == "SYSTEM" and block.signature is None
@@ -243,36 +252,11 @@ class Blockchain:
 
         off_pub = self.official_public_keys[block.official_id]
 
-        # 1. Check if signature verifies over the canonical block header
+        # Signature MUST verify over the canonical block header
         header_b = self._block_header_bytes(
             block.index, block.previous_hash, block.merkle_root, block.state_root, block.timestamp, block.official_id
         )
-        if cu.verify_signature(off_pub, header_b, block.signature):
-            return True
-
-        # 2. For single-transaction blocks, check if signature verifies over the transaction payload
-        if block.transactions and len(block.transactions) == 1 and block.transactions[0].get("official_id") == block.official_id:
-            try:
-                rec = cu.decrypt_payload(self.facility_key, block.transactions[0]["encrypted_payload"])
-                tx_b = self._tx_bytes(
-                    rec["employee_id"], rec["action"], block.official_id, rec["timestamp"], extra_data=rec.get("extra")
-                )
-                if cu.verify_signature(off_pub, tx_b, block.signature):
-                    return True
-            except Exception:
-                pass
-        elif not block.transactions and block.encrypted_payload != "GENESIS":
-            try:
-                rec = self.decrypt_record(block)
-                tx_b = self._tx_bytes(
-                    rec["employee_id"], rec["action"], block.official_id, rec["timestamp"], extra_data=rec.get("extra")
-                )
-                if cu.verify_signature(off_pub, tx_b, block.signature):
-                    return True
-            except Exception:
-                pass
-
-        return False
+        return cu.verify_signature(off_pub, header_b, block.signature)
 
     def _verify_tx_metadata_consistency(self, tx: dict, record: dict) -> bool:
         """
@@ -420,8 +404,8 @@ class Blockchain:
                 block_sig = cu.sign_bytes(proposer_priv, header_bytes)
             except Exception:
                 pass
-        if not block_sig and batch:
-            block_sig = batch[0]["signature"]
+        if not block_sig:
+            raise ValueError(f"Proposer private key for '{proposer_id}' required to produce valid PoA block header signature")
 
         block = Block(
             index=last_block.index + 1,
@@ -440,10 +424,13 @@ class Blockchain:
     # ── Path 1: Immediate Block Creation (Single Transaction) ────────────────
 
     def build_block_from_transaction(self, employee_id, action, official_id,
-                                      timestamp, signature, extra_data=None):
+                                      timestamp, signature, extra_data=None,
+                                      proposer_id=None, proposer_key=None,
+                                      proposer_signature=None):
         """
         Validate an already-signed transaction, execute chaincode dry-run,
-        construct a Merkle tree of [transaction], and build a new Block.
+        construct a Merkle tree of [transaction], authenticate the canonical block
+        header under PoA using the proposer's Ed448 key, and build a new Block.
         """
         if official_id not in self.official_public_keys:
             raise ValueError(f"'{official_id}' is not a registered Higher Official")
@@ -492,12 +479,28 @@ class Blockchain:
         merkle_root = MerkleTree([tx_record]).root
         last_block = self.chain[-1]
 
+        # Authenticate canonical block header under PoA (Fixes Block Header Authenticity)
+        proposer = proposer_id or official_id
+        if proposer_signature:
+            header_sig = proposer_signature
+        else:
+            priv = proposer_key
+            if not priv and os.path.exists(f"keys/{proposer}.key"):
+                with open(f"keys/{proposer}.key", "r", encoding="utf-8") as f:
+                    priv = cu.private_key_from_str(f.read().strip())
+            if not priv:
+                raise ValueError(f"Cannot produce required PoA block-header signature: key for '{proposer}' not found")
+            header_bytes = self._block_header_bytes(
+                last_block.index + 1, last_block.hash, merkle_root, new_state_root, timestamp, proposer
+            )
+            header_sig = cu.sign_bytes(priv, header_bytes)
+
         block = Block(
             index=last_block.index + 1,
             encrypted_payload=encrypted,
-            official_id=official_id,
+            official_id=proposer,
             previous_hash=last_block.hash,
-            signature=signature,
+            signature=header_sig,
             timestamp=timestamp,
             state_root=new_state_root,
             merkle_root=merkle_root,
@@ -919,3 +922,4 @@ class Blockchain:
         self.chaincode = replay_chaincode
         self.world_state = replay_state
         self._rewrite_storage()
+        return True
