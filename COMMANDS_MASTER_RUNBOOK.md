@@ -8,19 +8,20 @@
 ---
 
 ## 📋 Table of Contents
-1. [Phase 0: Environment Setup & Automated Test Suite](#phase-0-environment-setup--automated-test-suite)
-2. [Phase 1: Starting the Multi-Node Cluster](#phase-1-starting-the-multi-node-cluster)
+1. [Phase 0: Environment Setup & Automated Test Suite (36/36 Tests)](#phase-0-environment-setup--automated-test-suite)
+2. [Phase 1: Starting the Multi-Node Cluster & Process Inspection](#phase-1-starting-the-multi-node-cluster)
 3. [Phase 2: Inspecting the Raw On-Disk Database & JSON Files](#phase-2-inspecting-the-raw-on-disk-database--json-files)
 4. [Phase 3: Inspecting the World State Database Inside Nodes](#phase-3-inspecting-the-world-state-database-inside-nodes)
 5. [Phase 4: Querying Blockchain Ledgers Across All 3 Nodes](#phase-4-querying-blockchain-ledgers-across-all-3-nodes)
-6. [Phase 5: Submitting Signed Transactions from Terminal (CLI)](#phase-5-submitting-signed-transactions-from-terminal-cli)
+6. [Phase 5: Submitting Signed Transactions from Terminal (CLI & REST)](#phase-5-submitting-signed-transactions-from-terminal-cli)
 7. [Phase 6: Advanced Governance (CRL Revocation & 2-of-N Multi-Sig)](#phase-6-advanced-governance-crl-revocation--2-of-n-multi-sig)
 8. [Phase 7: Simulating Attacks & Self-Healing in Terminal](#phase-7-simulating-attacks--self-healing-in-terminal)
 9. [Phase 8: Zero-Knowledge Privacy Proofs (ZKP) in Terminal](#phase-8-zero-knowledge-privacy-proofs-zkp-in-terminal)
 10. [Phase 9: SPV Merkle Proofs & Offline Certificate Verification](#phase-9-spv-merkle-proofs--offline-certificate-verification)
 11. [Phase 10: High-Throughput Concurrency & TPS Stress Benchmark](#phase-10-high-throughput-concurrency--tps-stress-benchmark)
 12. [Phase 11: Cryptographic Employee Digital Identity Badges](#phase-11-cryptographic-employee-digital-identity-badges)
-13. [Quick Top-5 Presentation Cheat Sheet](#quick-top-5-presentation-cheat-sheet)
+13. [Phase 12: Standalone Demo Scripts Quick-Runner](#phase-12-standalone-demo-scripts-quick-runner)
+14. [Quick Top-5 Presentation Cheat Sheet](#quick-top-5-presentation-cheat-sheet)
 
 ---
 
@@ -30,23 +31,34 @@
 ```powershell
 pip install -r requirements.txt
 ```
-*Installs cryptographic dependencies: `blake3` (domain-keyed hashing), `cryptography` (Ed448 engine), `flask` (REST node daemon), and `requests`.*
+*Installs cryptographic dependencies: `blake3` (domain-keyed tree hashing), `cryptography` (RFC 8032 Ed448 engine & Fernet), `flask` (REST node daemon), and `requests`.*
 
 ### 2. Generate Genesis Keys & Consortium Configuration
 ```powershell
 python setup_network.py
 ```
 *Generates:*
-- `network_config.json`: Master peer topology, consortium policies, and official public keys.
+- `network_config.json`: Master peer topology, consortium policies, official public keys, and facility encryption key.
 - `keys/OFFICIAL_A.key` & `keys/OFFICIAL_B.key`: 448-bit Edwards-curve private signing keys.
-- `keys/facility_encryption.key`: 256-bit symmetric Fernet key for biometric payload privacy.
 
-### 3. Run the Automated Test Suite (30/30 Unit & Integration Tests)
+### 3. Run the Full Automated Test Suite (36/36 Unit & Integration Tests)
 ```powershell
 python -m unittest discover tests
 ```
 * **What to tell your professor:**  
-  *"Sir, before starting any server, our test suite verifies all mathematical invariants: Ed448 signature validity, BLAKE3 domain-keyed hash chaining, Merkle tree math, World State determinism, and 768-bit ZKP range proofs with 100% pass rate."*
+  *"Sir, before starting any server, our automated test suite verifies all mathematical invariants across 36 tests: RFC 8032 Ed448 signature validity, BLAKE3 domain-keyed hash chaining, Merkle tree inclusion proofs, World State determinism, live state tampering detection, replay protection, and 768-bit ZKP range proofs with a 100% pass rate."*
+
+### 4. Run Dedicated Security Audit Regression Tests
+```powershell
+python -m unittest tests/test_audit_fixes.py
+```
+*Runs regression tests verifying:*
+- **Finding A:** Live in-memory state tampering detection.
+- **Finding B:** PoA block-level proposer identity and header signature enforcement.
+- **Finding C:** Transaction metadata contradiction rejection.
+- **Finding D:** Monotonic timestamp replay attack prevention.
+- **Finding E:** Non-finite timestamp (NaN, Inf) strict sanitization.
+- **Certificate Verifier:** Rejection of fraudulent claims, bogus signatures, and fake Merkle proofs.
 
 ---
 
@@ -56,7 +68,7 @@ python -m unittest discover tests
 ```powershell
 python run_network.py
 ```
-*Automatically spawns Node 5000 (Leader / Explorer), Node 5001 (Validator), and Node 5002 (Validator) with color-coded log multiplexing and opens your browser to `http://localhost:5000`.*
+*Automatically spawns Node 5000 (Consortium Leader / Explorer), Node 5001 (Validator), and Node 5002 (Validator) with color-coded log multiplexing and opens your browser to `http://localhost:5000`.*
 
 ### Option B: Launch in 3 Separate PowerShell Windows (Manual Mode)
 If your professor wants to see each node running independently in separate terminal windows:
@@ -127,8 +139,8 @@ Get-Content .\data\node_5000\chain.jsonl -Tail 1 | ConvertFrom-Json | ConvertTo-
 ```
 * **What to explain:**  
   1. `encrypted_payload`: Biometric and personal identity fields are encrypted at rest with AES-GCM Fernet keys.
-  2. `signature`: 448-bit Ed448 signature guaranteeing non-repudiation.
-  3. `state_root`: Merkle Patricia snapshot of all entity balances and status after this block executed.
+  2. `signature`: 448-bit Ed448 signature over canonical header/transaction bytes guaranteeing non-repudiation.
+  3. `state_root`: Snapshot of all entity balances and status after this block executed.
   4. `merkle_root`: Merkle tree root of all transactions within this block.
 
 ### 6. Inspect the Consortium Network Configuration
@@ -168,12 +180,13 @@ Get-Content .\network_config.json | ConvertFrom-Json | Select-Object consensus, 
 ```
 *Sample Output:*
 ```text
-department           : Cybersecurity
-status               : IN
-last_check_in        : 1791835506.83
-last_check_out       : 1791835523.71
-total_seconds_worked : 28800.0
-registered_by        : OFFICIAL_A
+department             : Engineering
+status                 : IN
+last_check_in          : 1791875828.12
+last_check_out         : None
+last_action_timestamp  : 1791875828.12
+total_seconds_worked   : 3600.0
+registered_by          : OFFICIAL_A
 ```
 
 ### 4. Query the On-Chain Certificate Revocation List (CRL)
@@ -188,10 +201,11 @@ registered_by        : OFFICIAL_A
     Node5000_StateRoot = (Invoke-RestMethod http://localhost:5000/state).state_root
     Node5001_StateRoot = (Invoke-RestMethod http://localhost:5001/state).state_root
     Node5002_StateRoot = (Invoke-RestMethod http://localhost:5002/state).state_root
+    Live_State_Integrity = (Invoke-RestMethod http://localhost:5000/state).live_state_valid
 } | Format-List
 ```
 * **What to tell your professor:**  
-  *"Sir, notice that all 3 nodes have the exact same 256-bit State Root Hash. This mathematically proves that all nodes have reached 100% deterministic consensus on the World State database."*
+  *"Sir, notice that all 3 nodes have the exact same 256-bit State Root Hash and `live_state_valid = True`. This mathematically proves that all nodes have reached 100% deterministic consensus on the active World State database."*
 
 ---
 
@@ -224,7 +238,7 @@ registered_by        : OFFICIAL_A
 
 ---
 
-## Phase 5: Submitting Signed Transactions from Terminal (CLI)
+## Phase 5: Submitting Signed Transactions from Terminal (CLI & REST)
 
 ### 1. Client-Side Sign & Submit a Check-In for EMP1001
 ```powershell
@@ -243,7 +257,7 @@ python official_client.py OFFICIAL_A EMP1001 CHECK_IN --node http://localhost:50
 ```powershell
 python official_client.py OFFICIAL_A EMP1001 CHECK_OUT --node http://localhost:5000
 ```
-*Computes shift time elapsed, adds to cumulative hours, and sets status to `OUT`.*
+*Computes shift time elapsed, updates `last_action_timestamp`, adds to cumulative hours worked, and sets status to `OUT`.*
 
 ### 4. Onboard a New Employee (`EMP2001`) via REST API
 * **PowerShell:**
@@ -268,7 +282,7 @@ python official_client.py OFFICIAL_A EMP2001 CHECK_IN --node http://localhost:50
 ```powershell
 python demos/demo_governance.py
 ```
-*Demonstrates onboarding, CRL key revocation, and 2-of-N multi-sig emergency overrides.*
+*Demonstrates onboarding, CRL key revocation, and 2-of-N multi-sig emergency overrides with 100% compliance.*
 
 ### 2. Revoke an Official's Key on the Live Network (On-Chain CRL)
 ```powershell
@@ -279,7 +293,7 @@ Invoke-RestMethod -Method Post http://localhost:5000/portal/sign_and_submit -Con
 ```powershell
 python official_client.py OFFICIAL_B EMP1001 CHECK_IN --node http://localhost:5000
 ```
-*Rejection confirmed: Node rejects blocks signed by revoked official with `SignerRevokedError`.*
+*Rejection confirmed: Node rejects blocks signed by revoked official with `Official 'OFFICIAL_B' is REVOKED or inactive`.*
 
 ### 4. Execute a 2-of-N Multi-Signature Emergency Override
 ```powershell
@@ -297,34 +311,40 @@ python demos/demo_crypto_tamper.py
 ```
 *Demonstrates Attack 1 (modifying payload breaks BLAKE3 hash) and Attack 2 (re-hashing forward fails Ed448 signature check).*
 
-### 2. Corrupt Block #1 on Node 5001's Disk (Simulating Hacker / Bit-Rot)
+### 2. Run the Multi-Node Tamper Detection & Nakamoto Healing Demo
+```powershell
+python demos/demo_tamper_heal.py
+```
+*Automatically boots 3 temporary nodes, corrupts Node 5001's disk WAL, detects the fork, and verifies Nakamoto longest-valid-chain healing.*
+
+### 3. Corrupt Block #1 on Node 5001's Disk (Simulating Hacker / Bit-Rot)
 ```powershell
 Invoke-RestMethod -Method Post http://localhost:5001/debug/tamper_local_block -ContentType "application/json" -Body '{"block_index": 1}'
 ```
 
-### 3. Inspect Node 5001's Ledger to Show Corruption
+### 4. Inspect Node 5001's Ledger to Show Corruption
 ```powershell
 (Invoke-RestMethod http://localhost:5001/chain) | Select-Object index, hash, valid | Format-Table
 ```
 *Notice Block #1 now shows `valid: False`.*
 
-### 4. Trigger Nakamoto Consensus Auto-Healing on Node 5001
+### 5. Trigger Nakamoto Consensus Auto-Healing on Node 5001
 ```powershell
 Invoke-RestMethod -Method Post http://localhost:5001/nodes/resolve
 ```
 *Node 5001 contacts honest peers, downloads authentic blocks, verifies signatures, and repairs its disk WAL.*
 
-### 5. Verify Node 5001 is Restored to 100% Health
+### 6. Verify Node 5001 is Restored to 100% Health
 ```powershell
 (Invoke-RestMethod http://localhost:5001/chain) | Select-Object index, hash, valid | Format-Table
 ```
 *All blocks show `valid: True` again.*
 
-### 6. Simulate a Signature Forgery Attack
+### 7. Simulate a Signature Forgery Attack
 ```powershell
 Invoke-RestMethod -Method Post http://localhost:5000/debug/forge_and_broadcast -ContentType "application/json" -Body '{"employee_id":"EMP1003","action":"CHECK_IN","official_id":"OFFICIAL_A"}' | ConvertTo-Json -Depth 3
 ```
-*Peers independently reject the forged block despite valid BLAKE3 hash.*
+*Peers independently reject the forged block despite a mathematically consistent BLAKE3 hash.*
 
 ---
 
@@ -371,16 +391,21 @@ Invoke-RestMethod http://localhost:5000/audit/certificate/EMP1001 | ConvertTo-Js
 ```
 
 ### 4. Verify the Certificate Offline Using Standalone CLI Verifier
-```powershell
-python verify_certificate.py certificate_EMP1001.json
-```
+* **From Exported JSON File:**
+  ```powershell
+  python verify_certificate.py certificate_EMP1001.json
+  ```
+* **Directly Querying Node 5000:**
+  ```powershell
+  python verify_certificate.py --employee EMP1001
+  ```
 *Verifies the BLAKE3 seal, Ed448 digital signatures, and Merkle root commitments without needing internet or running servers.*
 
 ---
 
 ## Phase 10: High-Throughput Concurrency & TPS Stress Benchmark
 
-### 1. Run Live Mempool Concurrency Stress Test (25 Concurrent Tx)
+### 1. Run Live Mempool Concurrency Stress Test via API (25 Concurrent Tx)
 * **PowerShell:**
   ```powershell
   Invoke-RestMethod -Method Post http://localhost:5000/benchmark/run -ContentType "application/json" -Body '{"count": 25}' | Format-List
@@ -400,6 +425,12 @@ success                : True
 transactions_processed : 25
 ```
 
+### 2. Run Multi-Threaded Standalone Benchmark Suite
+```powershell
+python benchmark_network.py --txs 30 --workers 5
+```
+*Simulates high-frequency concurrent badge scans across 5 parallel worker threads, measuring P50, P90, P99 latency percentiles and mempool queue absorption.*
+
 ---
 
 ## Phase 11: Cryptographic Employee Digital Identity Badges
@@ -417,13 +448,27 @@ transactions_processed : 25
 
 ---
 
+## Phase 12: Standalone Demo Scripts Quick-Runner
+
+| Script | Purpose | Execution Command |
+| :--- | :--- | :--- |
+| **Interactive Terminal Showcase** | 11-step interactive color-coded menu | `powershell -ExecutionPolicy Bypass -File .\demo_showcase.ps1` |
+| **P2P Network Walkthrough** | 5-step cluster verification script | `python demos/demo_network_walkthrough.py` |
+| **Crypto & Tamper Resistance** | Mathematical proof of attack resistance | `python demos/demo_crypto_tamper.py` |
+| **Governance & 2-of-N Multi-Sig** | Onboarding, CRL revocation, emergency multi-sig | `python demos/demo_governance.py` |
+| **Tamper & Nakamoto Healing** | Multi-node disk corruption and self-healing | `python demos/demo_tamper_heal.py` |
+| **Full Automated Test Suite** | 36 unit and integration tests | `python -m unittest discover tests` |
+| **Security Audit Regression Suite**| Specific tests for audit vulnerabilities A-E | `python -m unittest tests/test_audit_fixes.py` |
+
+---
+
 ## Quick Top-5 Presentation Cheat Sheet
 *(Keep these 5 handy to quickly blow away your faculty during the live demo)*
 
 | # | Action | Exact PowerShell Command |
 | :- | :--- | :--- |
 | **1** | **Check Cluster Health** | `[PSCustomObject]@{ Node5000 = (irm http://localhost:5000/chain).Length; Node5001 = (irm http://localhost:5001/chain).Length; Node5002 = (irm http://localhost:5002/chain).Length; StateRoot = (irm http://localhost:5000/state).state_root.Substring(0,18)+'...' }` |
-| **2** | **View On-Disk Raw Ledger** | `Get-Content .\data\node_5000\chain.jsonl \| ForEach-Object { $_ \| ConvertFrom-Json } \| Select-Object index, official_id, hash, state_root \| ft -AutoSize` |
-| **3** | **View Live World State** | `(irm http://localhost:5000/state).world_state.employees \| ft -AutoSize` |
+| **2** | **View On-Disk Raw Ledger** | `Get-Content .\data\node_5000\chain.jsonl | ForEach-Object { $_ | ConvertFrom-Json } | Select-Object index, official_id, hash, state_root | ft -AutoSize` |
+| **3** | **View Live World State** | `(irm http://localhost:5000/state).world_state.employees | ft -AutoSize` |
 | **4** | **Corrupt & Heal Node 5001** | `irm -Method Post http://localhost:5001/debug/tamper_local_block -Body '{"block_index":1}' -ContentType "application/json"; irm -Method Post http://localhost:5001/nodes/resolve` |
 | **5** | **Verify ZKP Math** | `python -c "import zkp_utils; p = zkp_utils.generate_compliance_proof(28800, 28800, 'EMP1001'); print('ZKP Verified:', zkp_utils.verify_compliance_proof(p)[0])"` |
