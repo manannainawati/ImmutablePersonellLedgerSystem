@@ -111,7 +111,7 @@ class Blockchain:
             return
 
         genesis = blocks[0]
-        if genesis.hash != genesis.compute_hash():
+        if genesis.index != 0 or genesis.previous_hash != "0" or genesis.hash != genesis.compute_hash():
             raise ValueError("Corrupt genesis block in storage")
 
         # Replay transactions sequentially to restore World State
@@ -119,43 +119,82 @@ class Blockchain:
         for i in range(1, len(blocks)):
             b = blocks[i]
             prev = blocks[i - 1]
-            if b.previous_hash != prev.hash or b.hash != b.compute_hash():
+            if b.index != i or b.previous_hash != prev.hash or b.hash != b.compute_hash():
                 print(f"[blockchain] Corrupt chain linkage detected at block {b.index} in storage")
+                corrupted_index = i
+                break
+
+            # Block-level proposer and signature verification (Finding B)
+            if not self._verify_block_proposer_and_signature(b, self.world_state):
+                print(f"[blockchain] Invalid block proposer or signature at block {b.index} in storage")
                 corrupted_index = i
                 break
 
             try:
                 if b.transactions:
+                    if b.merkle_root != MerkleTree(b.transactions).root:
+                        raise ValueError(f"Merkle root mismatch at block {b.index}")
                     for tx in b.transactions:
                         tx_record = cu.decrypt_payload(self.facility_key, tx["encrypted_payload"])
+
+                        # Transaction metadata consistency check (Finding C)
+                        if not self._verify_tx_metadata_consistency(tx, tx_record):
+                            raise ValueError(f"Metadata contradiction at block {b.index}")
+
+                        tx_bytes = self._tx_bytes(
+                            tx_record["employee_id"], tx_record["action"],
+                            tx["official_id"], tx_record["timestamp"],
+                            extra_data=tx_record.get("extra"),
+                        )
+                        off_key = self.official_public_keys.get(tx["official_id"])
+                        if not off_key or not cu.verify_signature(off_key, tx_bytes, tx["signature"]):
+                            raise ValueError(f"Invalid transaction signature in block {b.index}")
+
                         tx_data = {
                             "employee_id": tx_record["employee_id"],
                             "timestamp": tx_record.get("timestamp", tx["timestamp"]),
                         }
                         if "extra" in tx_record:
                             tx_data.update(tx_record["extra"])
+                        if tx.get("tx_id"):
+                            tx_data["tx_id"] = tx["tx_id"]
                         self.chaincode.execute_transaction(self.world_state, tx_record["action"], tx_data, tx["official_id"])
+
+                    if not b.state_root or b.state_root != self.world_state.compute_state_root():
+                        raise ValueError(f"State root mismatch at block {b.index}")
                 else:
                     record = self.decrypt_record(b)
+                    tx_bytes = self._tx_bytes(
+                        record["employee_id"], record["action"],
+                        b.official_id, record["timestamp"],
+                        extra_data=record.get("extra"),
+                    )
+                    off_key = self.official_public_keys.get(b.official_id)
+                    if not off_key or not cu.verify_signature(off_key, tx_bytes, b.signature):
+                        raise ValueError(f"Invalid signature in block {b.index}")
+
                     tx_data = {
                         "employee_id": record["employee_id"],
                         "timestamp": record.get("timestamp", b.timestamp),
                     }
                     if "extra" in record:
                         tx_data.update(record["extra"])
-                    self.chaincode.execute_transaction(self.world_state, record["action"], tx_data, b.official_id)
+                    new_root = self.chaincode.execute_transaction(self.world_state, record["action"], tx_data, b.official_id)
+                    if not b.state_root or b.state_root != new_root:
+                        raise ValueError(f"State root mismatch at block {b.index}")
             except Exception as e:
                 print(f"[blockchain] State replay stopped at block {b.index}: {e}")
                 corrupted_index = i
                 break
 
-        self.chain = blocks
         if corrupted_index is not None:
-            print(f"[blockchain] Storage contains corrupted block(s) from index {corrupted_index}; awaiting peer healing.")
+            self.chain = blocks[:corrupted_index]
+            print(f"[blockchain] Storage contains corrupted block(s) from index {corrupted_index}; loaded valid prefix of {len(self.chain)} blocks, awaiting peer healing.")
         else:
+            self.chain = blocks
             print(f"[blockchain] Restored {len(self.chain)} blocks and World State from {self.storage_path}")
 
-    # ── Transaction bytes (canonical format) ─────────────────────────────────
+    # ── Transaction & Block Header Bytes (Canonical Format) ──────────────────
 
     @staticmethod
     def _tx_bytes(employee_id, action, official_id, timestamp, extra_data=None):
@@ -170,6 +209,97 @@ class Blockchain:
             if clean_extra:
                 payload["extra"] = clean_extra
         return json.dumps(payload, sort_keys=True).encode()
+
+    @staticmethod
+    def _block_header_bytes(index: int, previous_hash: str, merkle_root: str, state_root: str, timestamp: float, official_id: str) -> bytes:
+        """Canonical block header serialization for Proof of Authority proposal signatures."""
+        header = {
+            "index": index,
+            "merkle_root": merkle_root,
+            "official_id": official_id,
+            "previous_hash": previous_hash,
+            "state_root": state_root,
+            "timestamp": timestamp,
+        }
+        return json.dumps(header, sort_keys=True).encode()
+
+    def _verify_block_proposer_and_signature(self, block, current_state) -> bool:
+        """
+        Verify that block.official_id is an authorized active official and
+        block.signature cryptographically verifies against their public key.
+        (Fixes Finding B)
+        """
+        if block.index == 0:
+            return block.official_id == "SYSTEM" and block.signature is None
+
+        if not block.official_id or block.official_id not in self.official_public_keys:
+            return False
+
+        if not current_state.is_official_active(block.official_id):
+            return False
+
+        if not block.signature or not isinstance(block.signature, str):
+            return False
+
+        off_pub = self.official_public_keys[block.official_id]
+
+        # 1. Check if signature verifies over the canonical block header
+        header_b = self._block_header_bytes(
+            block.index, block.previous_hash, block.merkle_root, block.state_root, block.timestamp, block.official_id
+        )
+        if cu.verify_signature(off_pub, header_b, block.signature):
+            return True
+
+        # 2. For single-transaction blocks, check if signature verifies over the transaction payload
+        if block.transactions and len(block.transactions) == 1 and block.transactions[0].get("official_id") == block.official_id:
+            try:
+                rec = cu.decrypt_payload(self.facility_key, block.transactions[0]["encrypted_payload"])
+                tx_b = self._tx_bytes(
+                    rec["employee_id"], rec["action"], block.official_id, rec["timestamp"], extra_data=rec.get("extra")
+                )
+                if cu.verify_signature(off_pub, tx_b, block.signature):
+                    return True
+            except Exception:
+                pass
+        elif not block.transactions and block.encrypted_payload != "GENESIS":
+            try:
+                rec = self.decrypt_record(block)
+                tx_b = self._tx_bytes(
+                    rec["employee_id"], rec["action"], block.official_id, rec["timestamp"], extra_data=rec.get("extra")
+                )
+                if cu.verify_signature(off_pub, tx_b, block.signature):
+                    return True
+            except Exception:
+                pass
+
+        return False
+
+    def _verify_tx_metadata_consistency(self, tx: dict, record: dict) -> bool:
+        """
+        Guarantee that visible plaintext transaction fields in the block
+        strictly match the decrypted, cryptographically-signed payload.
+        (Fixes Finding C)
+        """
+        if tx.get("employee_id") != record.get("employee_id"):
+            return False
+        if tx.get("action") != record.get("action"):
+            return False
+        if "official_id" in record and tx.get("official_id") != record.get("official_id"):
+            return False
+        tx_ts = tx.get("timestamp")
+        rec_ts = record.get("timestamp")
+        if tx_ts is None or rec_ts is None or abs(float(tx_ts) - float(rec_ts)) > 1e-4:
+            return False
+        if tx.get("extra") != record.get("extra"):
+            return False
+        # Verify tx_id commitment if present
+        tx_bytes = self._tx_bytes(
+            record["employee_id"], record["action"], tx["official_id"], record["timestamp"], extra_data=record.get("extra")
+        )
+        expected_tx_id = blake3.blake3(tx_bytes).hexdigest()
+        if tx.get("tx_id") and tx.get("tx_id") != expected_tx_id:
+            return False
+        return True
 
     def decrypt_record(self, block):
         if block.encrypted_payload == "GENESIS":
@@ -277,12 +407,28 @@ class Blockchain:
         last_block = self.chain[-1]
         now = time.time()
 
+        # Proposer authenticates the block header under PoA (Fixes Finding B)
+        block_sig = None
+        key_path = f"keys/{proposer_id}.key"
+        if os.path.exists(key_path):
+            try:
+                with open(key_path, "r", encoding="utf-8") as f:
+                    proposer_priv = cu.private_key_from_str(f.read().strip())
+                header_bytes = self._block_header_bytes(
+                    last_block.index + 1, last_block.hash, merkle_root, new_state_root, now, proposer_id
+                )
+                block_sig = cu.sign_bytes(proposer_priv, header_bytes)
+            except Exception:
+                pass
+        if not block_sig and batch:
+            block_sig = batch[0]["signature"]
+
         block = Block(
             index=last_block.index + 1,
             encrypted_payload=batch[0]["encrypted_payload"],
             official_id=proposer_id,
             previous_hash=last_block.hash,
-            signature=batch[0]["signature"],
+            signature=block_sig,
             timestamp=now,
             state_root=new_state_root,
             merkle_root=merkle_root,
@@ -379,6 +525,8 @@ class Blockchain:
                 }
                 if "extra" in tx_record:
                     tx_data.update(tx_record["extra"])
+                if tx.get("tx_id"):
+                    tx_data["tx_id"] = tx["tx_id"]
                 staged_chaincode.execute_transaction(staged_state, tx_record["action"], tx_data, tx["official_id"])
 
         elif block.encrypted_payload != "GENESIS":
@@ -390,6 +538,9 @@ class Blockchain:
             if "extra" in record:
                 tx_data.update(record["extra"])
             staged_chaincode.execute_transaction(staged_state, record["action"], tx_data, block.official_id)
+
+        # Write to disk WAL FIRST before updating in-memory state (ensures crash-safety)
+        self._persist_block(block)
 
         # Atomic commit to active blockchain and world state
         self.world_state = staged_state
@@ -403,7 +554,19 @@ class Blockchain:
         else:
             self.mempool = [m for m in self.mempool if not (m["employee_id"] == block.official_id and m["timestamp"] == block.timestamp)]
 
-        self._persist_block(block)
+        # Secondary mempool prune: filter out transactions that are now invalid against new state
+        pruned_mempool = []
+        temp_mem_state = self.world_state.clone()
+        for pending in self.mempool:
+            p_data = {"employee_id": pending["employee_id"], "timestamp": pending["timestamp"]}
+            if pending.get("extra"):
+                p_data.update(pending["extra"])
+            try:
+                staged_chaincode.execute_transaction(temp_mem_state, pending["action"], p_data, pending["official_id"])
+                pruned_mempool.append(pending)
+            except Exception:
+                pass
+        self.mempool = pruned_mempool
 
     # ── Path 2: Receive Block from Peer ──────────────────────────────────────
 
@@ -413,9 +576,11 @@ class Blockchain:
           1. Index continuity
           2. previous_hash linkage
           3. BLAKE3 block hash self-consistency
-          4. BLAKE3 Merkle Tree Root verification over transactions
-          5. Payload decryptability & Ed448 signature verification per tx
-          6. Chaincode execution + State Root commitment verification
+          4. Proposer authorization & Ed448 header signature
+          5. BLAKE3 Merkle Tree Root verification over transactions
+          6. Metadata consistency vs decrypted signed payload
+          7. Payload decryptability & Ed448 signature verification per tx
+          8. Chaincode execution + State Root commitment verification
         """
         last_block = self.chain[-1]
 
@@ -425,6 +590,10 @@ class Blockchain:
             raise ValueError("previous_hash does not match this node's chain tip")
         if block.hash != block.compute_hash():
             raise ValueError("block hash does not match its own contents")
+
+        # Verify block proposer and header authenticity under PoA (Fixes Finding B)
+        if not self._verify_block_proposer_and_signature(block, self.world_state):
+            raise ValueError(f"Block proposer '{block.official_id}' or block signature invalid under PoA consensus")
 
         # Verify Merkle Root if transactions present
         if block.transactions:
@@ -441,6 +610,10 @@ class Blockchain:
                     record = cu.decrypt_payload(self.facility_key, tx["encrypted_payload"])
                 except Exception:
                     raise ValueError("transaction payload does not decrypt with facility key")
+
+                # Verify metadata consistency (Fixes Finding C)
+                if not self._verify_tx_metadata_consistency(tx, record):
+                    raise ValueError("Transaction visible metadata contradicts signed decrypted payload")
 
                 tx_bytes = self._tx_bytes(
                     record["employee_id"], record["action"],
@@ -459,6 +632,8 @@ class Blockchain:
                 }
                 if "extra" in record:
                     tx_data.update(record["extra"])
+                if tx.get("tx_id"):
+                    tx_data["tx_id"] = tx["tx_id"]
                 self.chaincode.execute_transaction(temp_state, record["action"], tx_data, tx["official_id"])
 
             if not block.state_root or block.state_root != temp_state.compute_state_root():
@@ -504,7 +679,16 @@ class Blockchain:
     # ── Full self-check ───────────────────────────────────────────────────────
 
     def is_chain_valid(self):
-        """Walk the chain and verify block hashes, signatures, Merkle roots, and State Roots."""
+        """
+        Walk the chain and independently verify:
+          1. Consecutive block indices (block.index == i)
+          2. BLAKE3 block hashes & previous_hash continuity
+          3. PoA block proposer authorization & Ed448 header signatures (Finding B)
+          4. BLAKE3 binary Merkle roots over transactions
+          5. Transaction metadata consistency vs decrypted signed payloads (Finding C)
+          6. Sequential Chaincode state transitions & committed State Roots
+          7. Live World State integrity vs ledger replayed state (Finding A)
+        """
         results = []
         replay_chaincode = ChaincodeEngine(
             self.config.get("personnel_registry", []),
@@ -512,26 +696,36 @@ class Blockchain:
             official_public_keys=self.official_public_keys,
         )
         replay_state = replay_chaincode.world_state
+        expected_genesis_root = replay_state.compute_state_root()
 
         for i, block in enumerate(self.chain):
             if i == 0:
-                ok = block.hash == block.compute_hash()
+                genesis_hash_ok = (
+                    block.index == 0
+                    and block.previous_hash == "0"
+                    and block.hash == block.compute_hash()
+                )
+                genesis_state_ok = (block.state_root == expected_genesis_root)
+                genesis_merkle_ok = (block.merkle_root == MerkleTree(["GENESIS"]).root)
+                ok = genesis_hash_ok and genesis_state_ok and genesis_merkle_ok
                 results.append(
                     {
                         "index": 0,
-                        "hash_ok": ok,
+                        "hash_ok": genesis_hash_ok,
                         "signature_ok": True,
                         "contract_ok": True,
-                        "state_root_ok": True,
-                        "merkle_root_ok": True,
+                        "state_root_ok": genesis_state_ok,
+                        "merkle_root_ok": genesis_merkle_ok,
                         "valid": ok,
                     }
                 )
                 continue
 
             prev = self.chain[i - 1]
+            index_ok = (block.index == i)
             hash_ok = (
-                block.hash == block.compute_hash()
+                index_ok
+                and block.hash == block.compute_hash()
                 and block.previous_hash == prev.hash
             )
 
@@ -540,7 +734,10 @@ class Blockchain:
             if block.transactions:
                 merkle_ok = (block.merkle_root == MerkleTree(block.transactions).root)
 
-            signature_ok = True
+            # Block proposer and header authenticity under PoA (Fixes Finding B)
+            proposer_sig_ok = self._verify_block_proposer_and_signature(block, replay_state)
+
+            signature_ok = proposer_sig_ok
             contract_ok = True
             state_root_ok = True
 
@@ -548,6 +745,12 @@ class Blockchain:
                 for tx in block.transactions:
                     try:
                         record = cu.decrypt_payload(self.facility_key, tx["encrypted_payload"])
+
+                        # Verify transaction metadata matches decrypted signed payload (Fixes Finding C)
+                        if not self._verify_tx_metadata_consistency(tx, record):
+                            signature_ok = False
+                            contract_ok = False
+
                         tx_bytes = self._tx_bytes(
                             record["employee_id"], record["action"],
                             tx["official_id"], record["timestamp"],
@@ -562,6 +765,8 @@ class Blockchain:
                         }
                         if "extra" in record:
                             tx_data.update(record["extra"])
+                        if tx.get("tx_id"):
+                            tx_data["tx_id"] = tx["tx_id"]
                         replay_chaincode.execute_transaction(replay_state, record["action"], tx_data, tx["official_id"])
                     except Exception:
                         contract_ok = False
@@ -576,7 +781,9 @@ class Blockchain:
                         extra_data=record.get("extra"),
                     )
                     off_key = self.official_public_keys.get(block.official_id)
-                    signature_ok = bool(off_key) and cu.verify_signature(off_key, tx_bytes, block.signature)
+                    sig_valid = bool(off_key) and cu.verify_signature(off_key, tx_bytes, block.signature)
+                    if not sig_valid:
+                        signature_ok = False
                     tx_data = {
                         "employee_id": record["employee_id"],
                         "timestamp": record.get("timestamp", block.timestamp),
@@ -601,6 +808,24 @@ class Blockchain:
                     "valid": hash_ok and signature_ok and contract_ok and state_root_ok and merkle_ok,
                 }
             )
+
+        # LIVE STATE REPLAY COMPARISON (Fixes Finding A)
+        # Compare live WorldState against independently replayed ledger state and latest committed block
+        if results:
+            live_state_root = self.world_state.compute_state_root()
+            replayed_state_root = replay_state.compute_state_root()
+            tip_block_root = self.chain[-1].state_root if self.chain else None
+
+            live_matches = (live_state_root == replayed_state_root and live_state_root == tip_block_root)
+            if not live_matches:
+                results[-1]["live_state_ok"] = False
+                results[-1]["state_root_ok"] = False
+                results[-1]["valid"] = False
+                results[-1]["error"] = (
+                    f"Live World State divergence: live root '{live_state_root[:16]}...' "
+                    f"does not match ledger replayed root '{replayed_state_root[:16]}...'"
+                )
+
         return results
 
     # ── Longest-valid-chain adoption ──────────────────────────────────────────
@@ -637,11 +862,20 @@ class Blockchain:
             if block.hash != block.compute_hash() or block.previous_hash != prev.hash:
                 raise ValueError(f"broken hash chain at block {block.index}")
 
+            # Verify block proposer and header authenticity under PoA (Fixes Finding B)
+            if not self._verify_block_proposer_and_signature(block, replay_state):
+                raise ValueError(f"invalid block proposer or signature at block {block.index}")
+
             if block.transactions:
                 if block.merkle_root != MerkleTree(block.transactions).root:
                     raise ValueError(f"invalid Merkle root at block {block.index}")
                 for tx in block.transactions:
                     record = cu.decrypt_payload(self.facility_key, tx["encrypted_payload"])
+
+                    # Verify metadata consistency (Fixes Finding C)
+                    if not self._verify_tx_metadata_consistency(tx, record):
+                        raise ValueError(f"metadata contradiction at block {block.index}")
+
                     tx_bytes = self._tx_bytes(
                         record["employee_id"], record["action"],
                         tx["official_id"], record["timestamp"],
@@ -656,6 +890,8 @@ class Blockchain:
                     }
                     if "extra" in record:
                         tx_data.update(record["extra"])
+                    if tx.get("tx_id"):
+                        tx_data["tx_id"] = tx["tx_id"]
                     replay_chaincode.execute_transaction(replay_state, record["action"], tx_data, tx["official_id"])
                 if not block.state_root or block.state_root != replay_state.compute_state_root():
                     raise ValueError(f"state root mismatch at block {block.index}")

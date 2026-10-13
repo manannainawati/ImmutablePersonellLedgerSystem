@@ -58,44 +58,97 @@ def verify_certificate_dict(cert: dict, config: dict = None) -> bool:
 
     # Step 3: Verify each historical on-chain event
     events = cert.get("audit_events", [])
+    expected_event_count = cert.get("on_chain_events_count", len(events))
+    if len(events) != expected_event_count:
+        print(f"  [FAIL] Event count mismatch: claimed {expected_event_count}, but found {len(events)} events.")
+        return False
+
+    hours_worked = cert.get("total_hours_worked", 0)
+    status = cert.get("current_status")
+    if len(events) == 0 and (hours_worked > 0 or status == "IN"):
+        print(f"  [FAIL] Certificate claims {hours_worked} hours worked / status '{status}' but contains NO verified on-chain audit events.")
+        return False
+
     print(f"\nVerifying {len(events)} On-Chain Historical Events:")
 
-    from merkle_tree import MerkleTree
+    from merkle_tree import MerkleTree, hash_leaf
     from blockchain import Blockchain
 
     for i, ev in enumerate(events):
         idx = ev.get("block_index")
         action = ev.get("action")
-        ts = time.ctime(ev.get("timestamp", 0))
+        raw_ts = ev.get("timestamp")
         off_id = ev.get("official_id")
         sig = ev.get("ed448_signature")
-        spv_proof = ev.get("spv_merkle_proof", [])
+        spv_proof = ev.get("spv_merkle_proof")
         merkle_root = ev.get("merkle_root")
 
-        print(f"\n  Event #{i+1} — Block #{idx}: {action} at {ts} (Official: {off_id})")
+        # Validate event fields
+        if idx is None or not isinstance(idx, int) or idx < 1:
+            print(f"    [FAIL] Event #{i+1} has invalid block index: {idx}")
+            return False
+
+        if not action or action not in {"CHECK_IN", "CHECK_OUT", "REGISTER_EMPLOYEE", "REVOKE_OFFICIAL", "ADMIN_OVERRIDE"}:
+            print(f"    [FAIL] Event #{i+1} has invalid action: {action}")
+            return False
+
+        if raw_ts is None or not isinstance(raw_ts, (int, float)) or not (0 < raw_ts < 1e12):
+            print(f"    [FAIL] Event #{i+1} has invalid or non-finite timestamp: {raw_ts}")
+            return False
+
+        if not off_id or not sig:
+            print(f"    [FAIL] Event #{i+1} missing official_id or ed448_signature")
+            return False
+
+        ts_str = time.ctime(raw_ts)
+        print(f"\n  Event #{i+1} — Block #{idx}: {action} at {ts_str} (Official: {off_id})")
 
         # Verify Ed448 signature using canonical transaction bytes
         tx_bytes = Blockchain._tx_bytes(
-            cert.get("employee_id"), action, off_id, ev.get("timestamp"), extra_data=ev.get("extra")
+            cert.get("employee_id"), action, off_id, raw_ts, extra_data=ev.get("extra")
         )
 
         pub_key = official_keys.get(off_id)
-        if not pub_key or not cu.verify_signature(pub_key, tx_bytes, sig):
+        if not pub_key:
+            print(f"    [FAIL] Official '{off_id}' not found in active network public key registry")
+            return False
+
+        sig_verified = cu.verify_signature(pub_key, tx_bytes, sig)
+        if not sig_verified:
+            # Fallback: test block header signature if single-tx block header signature was provided
+            header_bytes = Blockchain._block_header_bytes(
+                idx, ev.get("previous_hash", ""), merkle_root or "", ev.get("state_root", ""), raw_ts, off_id
+            )
+            sig_verified = cu.verify_signature(pub_key, header_bytes, sig)
+
+        if not sig_verified:
             print(f"    [FAIL] Ed448 Digital Signature verification FAILED for official {off_id}")
             return False
         print(f"    [PASS] Ed448 Digital Signature verified with official public key")
 
         # Verify SPV Merkle inclusion proof
-        if spv_proof and merkle_root:
-            tx_leaf = ev.get("tx_leaf") or {
-                "employee_id": cert.get("employee_id"),
-                "action": action,
-                "timestamp": ev.get("timestamp"),
-            }
+        if not merkle_root:
+            print(f"    [FAIL] Event #{i+1} missing Merkle Root commitment")
+            return False
+
+        tx_leaf = ev.get("tx_leaf")
+        if spv_proof:
+            if not tx_leaf:
+                tx_leaf = {
+                    "employee_id": cert.get("employee_id"),
+                    "action": action,
+                    "timestamp": raw_ts,
+                }
             if not MerkleTree.verify_proof(tx_leaf, spv_proof, merkle_root):
                 print(f"    [FAIL] SPV Merkle inclusion proof verification FAILED against root {merkle_root}")
                 return False
             print(f"    [PASS] SPV Merkle Proof path mathematically verified with {len(spv_proof)} sibling nodes")
+        elif tx_leaf:
+            leaf_bytes = json.dumps(tx_leaf, sort_keys=True).encode() if isinstance(tx_leaf, dict) else str(tx_leaf).encode()
+            if hash_leaf(leaf_bytes).lower() != merkle_root.lower():
+                print(f"    [FAIL] Standalone Merkle root commitment {merkle_root} does not match leaf hash {hash_leaf(leaf_bytes)}")
+                return False
+            print(f"    [PASS] Root commitment verified: Merkle Root matches leaf hash = {merkle_root[:16]}...")
         elif merkle_root:
             print(f"    [PASS] Root commitment verified: Merkle Root = {merkle_root[:16]}...")
 

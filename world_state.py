@@ -53,7 +53,18 @@ class WorldState:
         cloned.employees = copy.deepcopy(self.employees)
         cloned.officials = copy.deepcopy(self.officials)
         cloned.meta = copy.deepcopy(self.meta)
+        cloned.executed_tx_ids = set(getattr(self, "executed_tx_ids", set()))
         return cloned
+
+    def is_tx_executed(self, tx_id: str) -> bool:
+        if not hasattr(self, "executed_tx_ids"):
+            self.executed_tx_ids = set()
+        return tx_id in self.executed_tx_ids
+
+    def mark_tx_executed(self, tx_id: str):
+        if not hasattr(self, "executed_tx_ids"):
+            self.executed_tx_ids = set()
+        self.executed_tx_ids.add(tx_id)
 
     # ── Official Management ──────────────────────────────────────────────────
 

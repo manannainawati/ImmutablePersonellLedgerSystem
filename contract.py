@@ -63,6 +63,15 @@ class ChaincodeEngine:
         Returns the new 64-char BLAKE3 State Root Hash.
         Raises ContractViolation on any illegal state transition.
         """
+        import math
+
+        if not isinstance(data, dict):
+            raise ContractViolation("Transaction data payload must be a dictionary")
+        if not isinstance(official_id, str) or not official_id.strip():
+            raise ContractViolation("Transaction official_id must be a non-empty string")
+        if not isinstance(action, str) or not action.strip():
+            raise ContractViolation("Transaction action must be a non-empty string")
+
         # Rule 1: Originating official must be registered and ACTIVE
         if not state.is_official_active(official_id):
             raise ContractViolation(f"Official '{official_id}' is not an active, authorized official (revoked or unknown)")
@@ -71,9 +80,18 @@ class ChaincodeEngine:
         emp_id = data.get("employee_id")
         ts = data.get("timestamp", 0)
 
-        # Invariant: Timestamp must be a valid positive number
-        if not isinstance(ts, (int, float)) or ts <= 0:
-            raise ContractViolation(f"Invalid transaction timestamp '{ts}'. Must be positive number.")
+        # Invariant: Timestamp must be a finite, positive number within reasonable bounds (Fixes Finding E)
+        if not isinstance(ts, (int, float)) or isinstance(ts, bool) or not math.isfinite(ts) or ts <= 0:
+            raise ContractViolation(f"Invalid transaction timestamp '{ts}'. Must be a finite, positive number.")
+        if ts > 1e12:
+            raise ContractViolation(f"Transaction timestamp '{ts}' exceeds reasonable bounds (must be <= 1e12).")
+
+        # Replay protection: check transaction ID if provided
+        tx_id = data.get("tx_id")
+        if tx_id:
+            if state.is_tx_executed(tx_id):
+                raise ContractViolation(f"Replay detected: transaction '{tx_id}' has already been executed on-chain")
+            state.mark_tx_executed(tx_id)
 
         if action in ("CHECK_IN", "CHECK_OUT"):
             self._handle_attendance(state, emp_id, action, ts, official_id)
@@ -98,27 +116,43 @@ class ChaincodeEngine:
     # ── Action Handlers ──────────────────────────────────────────────────────
 
     def _handle_attendance(self, state: WorldState, emp_id: str, action: str, ts: float, official_id: str):
-        if not emp_id:
-            raise ContractViolation("Missing 'employee_id' in attendance transaction")
+        if not emp_id or not isinstance(emp_id, str):
+            raise ContractViolation("Missing or invalid 'employee_id' in attendance transaction")
         if not state.is_employee_registered(emp_id):
             raise ContractViolation(f"'{emp_id}' is not in the personnel registry")
 
         emp = state.get_employee(emp_id)
         current_status = emp.get("status", "OUT")
+        last_action_ts = emp.get("last_action_timestamp")
+
+        # Invariant: Strict per-employee timestamp monotonicity & replay protection (Fixes Finding D)
+        if last_action_ts is not None and ts <= last_action_ts:
+            raise ContractViolation(
+                f"Replay or out-of-order transaction for '{emp_id}': timestamp ({ts}) "
+                f"must be strictly greater than last action timestamp ({last_action_ts})"
+            )
 
         if action == "CHECK_IN":
             if current_status == "IN":
                 raise ContractViolation(f"'{emp_id}' is already checked in")
+
+            last_out = emp.get("last_check_out")
+            if last_out is not None and ts <= last_out:
+                raise ContractViolation(
+                    f"Replay detected: check-in timestamp ({ts}) must be strictly greater than last check-out ({last_out})"
+                )
+
             state.record_check_in(emp_id, ts)
+            emp["last_action_timestamp"] = ts
 
         elif action == "CHECK_OUT":
             if current_status == "OUT":
                 raise ContractViolation(f"'{emp_id}' is not checked in")
             
             last_in = emp.get("last_check_in")
-            if last_in is not None and ts < last_in:
+            if last_in is not None and ts <= last_in:
                 raise ContractViolation(
-                    f"Negative shift duration: Check-out timestamp ({ts}) cannot be earlier than check-in ({last_in})"
+                    f"Check-out timestamp ({ts}) must be strictly greater than check-in ({last_in})"
                 )
 
             # Check shift duration warning (>16 hours = 57,600s)
@@ -126,6 +160,7 @@ class ChaincodeEngine:
                 emp["shift_warning"] = "EXCESSIVE_SHIFT_DURATION_EXCEEDS_16H"
 
             state.record_check_out(emp_id, ts)
+            emp["last_action_timestamp"] = ts
 
     def _handle_register_employee(self, state: WorldState, emp_id: str, dept: str, official_id: str):
         if not emp_id:
@@ -180,6 +215,13 @@ class ChaincodeEngine:
             raise ContractViolation(f"'{emp_id}' is not in the personnel registry")
 
         emp = state.get_employee(emp_id)
+        last_action_ts = emp.get("last_action_timestamp")
+        if last_action_ts is not None and ts <= last_action_ts:
+            raise ContractViolation(
+                f"Replay or out-of-order override for '{emp_id}': timestamp ({ts}) "
+                f"must be strictly greater than last action timestamp ({last_action_ts})"
+            )
+        emp["last_action_timestamp"] = ts
 
         # Shift accounting reconciliation
         if target_status == "OUT" and emp.get("status") == "IN" and emp.get("last_check_in"):

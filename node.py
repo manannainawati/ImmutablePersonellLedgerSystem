@@ -190,10 +190,16 @@ def verify():
 
 @app.route("/state")
 def get_state():
-    """Returns the current World State snapshot and State Root Hash."""
+    """Returns the current World State snapshot, State Root Hash, and live-state integrity check."""
+    live_root = chain.world_state.compute_state_root()
+    tip_root = chain.chain[-1].state_root if chain.chain else None
+    validation = chain.is_chain_valid()
+    chain_valid = all(b.get("valid", False) for b in validation)
     return jsonify({
-        "state_root": chain.world_state.compute_state_root(),
+        "state_root": live_root,
         "world_state": chain.world_state.to_dict(),
+        "chain_tip_state_root": tip_root,
+        "live_state_valid": (live_root == tip_root) and chain_valid,
     })
 
 
@@ -533,28 +539,34 @@ def audit_certificate(employee_id):
                 if rec.get("employee_id") == employee_id:
                     matched = True
                     tx_details = rec
+                    tx_leaf = tx
                     tree = MerkleTree(b.transactions)
                     merkle_proof = tree.get_proof(tx_idx)
+                    official_id = tx.get("official_id", b.official_id)
+                    sig = tx.get("signature", b.signature)
                     break
         else:
             rec = chain.decrypt_record(b)
             if rec.get("employee_id") == employee_id:
                 matched = True
                 tx_details = rec
-                tree = MerkleTree([{"employee_id": rec["employee_id"], "action": rec["action"], "timestamp": b.timestamp}])
+                tx_leaf = b.encrypted_payload
                 merkle_proof = []
+                official_id = b.official_id
+                sig = b.signature
 
         if matched:
             audit_records.append({
                 "block_index": b.index,
                 "timestamp": b.timestamp,
                 "action": tx_details.get("action"),
-                "official_id": b.official_id,
-                "ed448_signature": b.signature,
+                "official_id": official_id,
+                "ed448_signature": sig,
                 "block_hash": b.hash,
                 "state_root": b.state_root,
                 "merkle_root": b.merkle_root,
                 "spv_merkle_proof": merkle_proof,
+                "tx_leaf": tx_leaf,
             })
 
     cert_data = {
@@ -596,29 +608,36 @@ def run_benchmark():
     latencies = []
     blocks_before = len(chain.chain)
 
-    # Alternate check-ins and check-outs across employees
-    for i in range(tx_count):
-        emp_id = f"EMP100{1 + (i % 3)}"
-        emp = chain.world_state.get_employee(emp_id)
-        action = "CHECK_OUT" if (emp and emp["status"] == "IN") else "CHECK_IN"
+    with CHAIN_LOCK:
+        t_base = max(time.time(), chain.chain[-1].timestamp + 1 if chain.chain else 0)
+        # Alternate check-ins and check-outs across employees with monotonic timestamps
+        for i in range(tx_count):
+            emp_id = f"EMP100{1 + (i % 3)}"
+            
+            # Check status on simulated state incorporating unconfirmed mempool
+            sim_state = chain.world_state.clone()
+            for pending in chain.mempool:
+                p_data = {"employee_id": pending["employee_id"], "timestamp": pending["timestamp"]}
+                if pending.get("extra"):
+                    p_data.update(pending["extra"])
+                try:
+                    chain.chaincode.execute_transaction(sim_state, pending["action"], p_data, pending["official_id"])
+                except Exception:
+                    pass
+            emp = sim_state.get_employee(emp_id)
+            action = "CHECK_OUT" if (emp and emp["status"] == "IN") else "CHECK_IN"
 
-        t_tx = time.time()
-        tx_b = Blockchain._tx_bytes(emp_id, action, "OFFICIAL_A", t_tx)
-        sig = cu.sign_bytes(priv_A, tx_b)
-        t0 = time.time()
-        chain.add_to_mempool(emp_id, action, "OFFICIAL_A", t_tx, sig)
-        latencies.append((time.time() - t0) * 1000)
+            t_tx = t_base + (i + 1) * 1.0
+            tx_b = Blockchain._tx_bytes(emp_id, action, "OFFICIAL_A", t_tx)
+            sig = cu.sign_bytes(priv_A, tx_b)
+            t0 = time.time()
+            chain.add_to_mempool(emp_id, action, "OFFICIAL_A", t_tx, sig)
+            latencies.append((time.time() - t0) * 1000)
 
-        # Update local temp state so subsequent mempool entries pass validation
-        try:
-            chain.chaincode.execute_transaction(chain.world_state, action, {"employee_id": emp_id, "timestamp": t_tx}, "OFFICIAL_A")
-        except Exception:
-            pass
-
-    packed_block = chain.build_block_from_mempool(max_txs=tx_count, proposer_id="OFFICIAL_A")
-    if packed_block:
-        chain.append_block(packed_block)
-        _broadcast(packed_block)
+        packed_block = chain.build_block_from_mempool(max_txs=tx_count, proposer_id="OFFICIAL_A")
+        if packed_block:
+            chain.append_block(packed_block)
+            _broadcast(packed_block)
 
     total_time = max(time.time() - t_start, 0.001)
     tps = round(tx_count / total_time, 1)

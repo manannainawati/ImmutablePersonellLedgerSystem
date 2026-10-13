@@ -3,8 +3,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Temporary test data
+# Temporary test & node persistence data
 data/test_*
+data/node_*
+*.tmp
 
 # System & IDE artifacts
 .vscode/
@@ -12,3 +14,4 @@ data/test_*
 .DS_Store
 Thumbs.db
 *.log
+
