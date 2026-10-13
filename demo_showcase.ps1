@@ -223,7 +223,7 @@ function Run-AllDemonstration {
 function Main-Menu {
     Clear-Host
     Write-Host "==========================================================================" -ForegroundColor Cyan
-    Write-Host "       IPLS BLOCKCHAIN — INTERACTIVE TERMINAL DEMO SHOWCASE             " -ForegroundColor Yellow
+    Write-Host "       IPLS BLOCKCHAIN -- INTERACTIVE TERMINAL DEMO SHOWCASE             " -ForegroundColor Yellow
     Write-Host "==========================================================================" -ForegroundColor Cyan
     Write-Host "  1. Multi-Node Cluster Health & TCP Ports"
     Write-Host "  2. Inspect Raw On-Disk Database (data/node_5000/chain.jsonl)"
